@@ -1,6 +1,6 @@
 # HL2_Combine_Kick_ThrowBack_Grenades
 [ Techinical Differences Between The TrowBack and Kick]
-- ThowBack:
+THROWBACK
 
 I wanted this to feel like a tactical, well-thought-out decision, so here’s what happens:
 - The Soldier will look at the grenade 
@@ -15,7 +15,7 @@ I wanted this to feel like a tactical, well-thought-out decision, so here’s wh
 - The lore reason I came up to justify this is because the Combine Soldiers have a software on their helmets that sends a signal that resets the grenade timer.
 //////////////////////////////
 //////////////////////////////
-- Kick: 
+KICK 
 
 I wanted this to look like a desperate act, so here’s what happens:
 - The Soldier will look at the grenade 
