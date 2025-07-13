@@ -1,5 +1,5 @@
 # HL2_Combine_Kick_ThrowBack_Grenades
-[ Techinical Differences Between The TrowBack and Kick]
+[ Techinical Differences Between The TrowBack and Kick ]
 
 THROWBACK
 
@@ -28,7 +28,7 @@ I wanted this to look like a desperate act, so here’s what happens:
 //////////////////////////////
 //////////////////////////////
 
-[ How To Find The Custom Logics]
+[ How To Find The Custom Logics ]
 
 Just hit Ctrl+F and search for the word MODIFICATION. That’ll take you straight to the custom parts of the code, so you can easily see what’s new versus what’s original Valve code. I also added comments to help explain the purpose of each line I created, making it easier for anyone to understand the goals behind the changes.
 
@@ -38,7 +38,7 @@ Just hit Ctrl+F and search for the word MODIFICATION. That’ll take you straigh
 //////////////////////////////
 
 
-[ Brief Story]
+[ Brief Story ]
 
 Code that gives Half-Life 2 Combine Soldiers the ability to throw back or kick enemy grenades away
 This is my first project in modding. I thought it would be cool for the Combine soldiers to have this ability, so I went ahead and tried to implement it.
