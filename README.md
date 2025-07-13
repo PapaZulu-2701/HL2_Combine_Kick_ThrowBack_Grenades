@@ -1,13 +1,16 @@
 # HL2_Combine_Kick_ThrowBack_Grenades
 [ How To Find The Custom Logics]
+
 Just hit Ctrl+F and search for the word MODIFICATION. That’ll take you straight to the custom parts of the code, so you can easily see what’s new versus what’s original Valve code. I also added comments to help explain the purpose of each line I created, making it easier for anyone to understand the goals behind the changes.
 
 [ Brief Story]
+
 Code that gives Half-Life 2 Combine Soldiers the ability to throw back or kick enemy grenades away
 This is my first project in modding. I thought it would be cool for the Combine soldiers to have this ability, so I went ahead and tried to implement it.
 At first, my goal was simply to enhance my own game experience. But then I realized it could be fun to share it with other people or creators who might like what they see.
 
 [ Making Things Clear ]
+
 I want to be upfront: I don’t actually know how to code in C++, especially not in SDK2013. I’m not a professional coder or even particularly smart, and I don’t want anyone to think that I am. I used GeminiPro to help me write the code.
 
 But it’s important to say that the code only reached its current state because these were the ideas, logic, and approaches that I thought were best. I guided the AI to write it correctly, using only code and logic that SDK2013 recognizes.
@@ -19,6 +22,7 @@ By saying all this, I just want to make it clear: I don’t claim the code as mi
 So feel free to use it exactly as it is, or treat it as a blueprint to build your own version. Either way, I hope it helps!
 
 [ Functionality ]
+
 The code is working perfectly—it doesn’t cause crashes or have any noticeable bugs. I did my best to clean those up.
 
 This behavior only triggers if the grenade is really close to the soldier, almost touching his foot. If the grenade lands even just 1 unit farther away, the soldier will stick to his default behavior and run from it.
