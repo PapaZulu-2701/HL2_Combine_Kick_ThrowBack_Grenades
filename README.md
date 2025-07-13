@@ -2,7 +2,7 @@
 [ Techinical Differences Between The TrowBack and Kick]
 - ThowBack:
 
-I wanted to make this a tactial though out decision, so what happen is:
+I wanted this to feel like a tactical, well-thought-out decision, so here’s what happens:
 - The Soldier will look at the grenade 
 - Crouch (Default animation)
 - "Pick" the Grenade (Actually he's using the Gravity Gun Pull Code/Mechanic of the game)
@@ -17,7 +17,7 @@ I wanted to make this a tactial though out decision, so what happen is:
 
 - Kick: 
 
-I wanted to make this look like an desperate act, so what happen is:
+I wanted this to look like a desperate act, so here’s what happens:
 . The Soldier will look at the grenade 
 . Will kick it away in the current direction his facing
 . The Timer of the grenade will not be reseted
