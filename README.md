@@ -13,8 +13,8 @@ I wanted this to feel like a tactical, well-thought-out decision, so here’s wh
 - The default animations were so slow that the grenade allways exploded on the soldier hand
 - So I also used the Gravity Gun pull game mechanic that by default reset the enemy grenade timer when you pick one
 - The lore reason I came up to justify this is because the Combine Soldiers have a software on their helmets that sends a signal that resets the grenade timer.
-
-
+//////////////////////////////
+//////////////////////////////
 - Kick: 
 
 I wanted this to look like a desperate act, so here’s what happens:
@@ -22,10 +22,18 @@ I wanted this to look like a desperate act, so here’s what happens:
 - Will kick it away in the current direction his facing
 - The Timer of the grenade will not be reseted
 
+//////////////////////////////
+//////////////////////////////
 
 [ How To Find The Custom Logics]
 
 Just hit Ctrl+F and search for the word MODIFICATION. That’ll take you straight to the custom parts of the code, so you can easily see what’s new versus what’s original Valve code. I also added comments to help explain the purpose of each line I created, making it easier for anyone to understand the goals behind the changes.
+
+//////////////////////////////
+//////////////////////////////
+//////////////////////////////
+//////////////////////////////
+
 
 [ Brief Story]
 
