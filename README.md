@@ -18,9 +18,9 @@ I wanted this to feel like a tactical, well-thought-out decision, so here’s wh
 - Kick: 
 
 I wanted this to look like a desperate act, so here’s what happens:
-. The Soldier will look at the grenade 
-. Will kick it away in the current direction his facing
-. The Timer of the grenade will not be reseted
+- The Soldier will look at the grenade 
+- Will kick it away in the current direction his facing
+- The Timer of the grenade will not be reseted
 
 
 [ How To Find The Custom Logics]
