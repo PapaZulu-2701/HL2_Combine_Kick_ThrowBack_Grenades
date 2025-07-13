@@ -1,5 +1,6 @@
 # HL2_Combine_Kick_ThrowBack_Grenades
 [ Techinical Differences Between The TrowBack and Kick]
+
 THROWBACK
 
 I wanted this to feel like a tactical, well-thought-out decision, so here’s what happens:
@@ -13,8 +14,10 @@ I wanted this to feel like a tactical, well-thought-out decision, so here’s wh
 - The default animations were so slow that the grenade allways exploded on the soldier hand
 - So I also used the Gravity Gun pull game mechanic that by default reset the enemy grenade timer when you pick one
 - The lore reason I came up to justify this is because the Combine Soldiers have a software on their helmets that sends a signal that resets the grenade timer.
+
 //////////////////////////////
 //////////////////////////////
+
 KICK 
 
 I wanted this to look like a desperate act, so here’s what happens:
