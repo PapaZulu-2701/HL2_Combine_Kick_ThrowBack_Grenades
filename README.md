@@ -22,7 +22,7 @@ KICK
 
 I wanted this to look like a desperate act, so here’s what happens:
 - The Soldier will look at the grenade 
-- Will kick it away in the current direction his facing
+- Will kick it away in the current direction he is facing
 - The Timer of the grenade will not be reseted
 
 //////////////////////////////
