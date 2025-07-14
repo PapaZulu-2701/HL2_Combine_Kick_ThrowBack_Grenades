@@ -3036,14 +3036,16 @@ void CNPC_Combine::HandleAnimEvent(animevent_t* pEvent)
 			// ▼▼▼ A NOSSA ÚNICA MODIFICAÇÃO ESTÁ NESTE CASE ▼▼▼
 		case COMBINE_AE_GREN_TOSS:
 		{
-			// Verificação para a habilidade "Devolver ao Remetente"
+					// [CUSTOM LOGIC START]
+			// First, check if the soldier is in the "Return to Sender" state.
 			if (m_bIsReturningGrenade)
-			{
-				DevMsg("HandleAnimEvent: GREN_TOSS bloqueado! O soldado está no modo 'Devolver'.\n");
-				// Retornamos imediatamente para não criar a granada duplicada.
-				// O handledEvent não é setado, o que é correto neste caso.
-				return;
-			}
+		{
+			// If true, it means we are throwing back a caught grenade using the Task logic.
+			// We must exit immediately to prevent this animation event from creating
+			// a second, duplicate grenade from the inventory.
+			return;
+		}
+		// [CUSTOM LOGIC END]
 
 			// Se não estivermos no modo devolver, o código original da Valve é executado.
 			DevMsg("HandleAnimEvent: GREN_TOSS executado. Arremesso de granada normal da IA.\n");
