@@ -1,9 +1,3 @@
-/*
- Reminder:
- Use CTRL+F to search for "MODIFICATION" and easily spot what's custom 
- versus what's original Valve code.
-*/
-
 //========= Copyright Valve Corporation, All rights reserved. ============//
 //
 // Purpose: 
@@ -11,3312 +5,1205 @@
 //=============================================================================//
 
 #include "cbase.h"
-#include "ai_hull.h"
-#include "ai_navigator.h"
-#include "ai_motor.h"
-#include "ai_squadslot.h"
-#include "ai_squad.h"
-#include "ai_route.h"
-#include "ai_interactions.h"
-#include "ai_tacticalservices.h"
 #include "soundent.h"
-#include "game.h"
 #include "npcevent.h"
-#include "npc_combine.h"
-#include "activitylist.h"
-#include "player.h"
-#include "basecombatweapon.h"
+#include "globalstate.h"
+#include "ai_squad.h"
+#include "ai_tacticalservices.h"
+#include "npc_manhack.h"
+#include "npc_metropolice.h"
+#include "weapon_stunstick.h"
 #include "basegrenade_shared.h"
-#include "vstdlib/random.h"
-#include "engine/IEngineSound.h"
-#include "globals.h"
-#include "grenade_frag.h"
-#include "ndebugoverlay.h"
-#include "weapon_physcannon.h"
-#include "SoundEmitterSystem/isoundemittersystembase.h"
-#include "npc_headcrab.h"
+#include "ai_route.h"
+#include "hl2_player.h"
+#include "iservervehicle.h"
+#include "items.h"
+#include "hl2_gamerules.h"
+#include "grenade_frag.h"		// [MODIFICATION] Required to identify the grenade entity by its classname.
 #include "physics.h"                    // [MODIFICATION] Required for core VPhysics definitions..
 #include "vphysics_interface.h"        // [MODIFICATION] Required for IPhysicsObject and functions like VPhysicsGetObject().
 #ifdef MAPBASE
+#include "grenade_frag.h"
 #include "mapbase/GlobalStrings.h"
-#include "globalstate.h"
-#include "sceneentity.h"
 #endif
 
 // memdbgon must be the last include file in a .cpp file!!!
 #include "tier0/memdbgon.h"
 
+//#define SF_METROPOLICE_					0x00010000
+#define SF_METROPOLICE_SIMPLE_VERSION		0x00020000
+#define SF_METROPOLICE_ALWAYS_STITCH		0x00080000
+#define SF_METROPOLICE_NOCHATTER			0x00100000
+#define SF_METROPOLICE_ARREST_ENEMY			0x00200000
+#define SF_METROPOLICE_NO_FAR_STITCH		0x00400000
+#define SF_METROPOLICE_NO_MANHACK_DEPLOY	0x00800000
+#define SF_METROPOLICE_ALLOWED_TO_RESPOND	0x01000000
+#define SF_METROPOLICE_MID_RANGE_ATTACK		0x02000000
+
+#define METROPOLICE_MID_RANGE_ATTACK_RANGE	3500.0f
+
+#define METROPOLICE_SQUAD_STITCH_MIN_INTERVAL	1.0f
+#define METROPOLICE_SQUAD_STITCH_MAX_INTERVAL	1.2f
+
+#define AIM_ALONG_SIDE_LINE_OF_DEATH_DISTANCE		300.0f
+#define AIM_ALONG_SIDE_STEER_DISTANCE				200.0f
+#define AIM_ALONG_SIDE_DEFAULT_STITCH_LENGTH		750.0f
+#define AIM_ALONG_SIDE_LINE_OF_DEATH_LEAD_TIME		0.0f
+#define AIM_ALONG_SIDE_LINE_INITIAL_DRAW_FRACTION	0.2f
+
+#define AIM_BEHIND_DEFAULT_STITCH_LENGTH		1000.0f
+#define AIM_BEHIND_MINIMUM_DISTANCE				650.0f
+#define AIM_BEHIND_STEER_DISTANCE				150.0f
+
+#define RECENT_DAMAGE_INTERVAL		3.0f
+#define RECENT_DAMAGE_THRESHOLD		0.2f
+
+#define VEHICLE_PREDICT_ACCELERATION		333.0f
+#define VEHICLE_PREDICT_MAX_SPEED			600.0f
+
+#define	METROPOLICE_MAX_WARNINGS	3
+
+#define	METROPOLICE_BODYGROUP_MANHACK	1
+
+enum
+{
+	// NOTE: Exact #s are important, since they are referred to by number in schedules below
+
+	METROPOLICE_SENTENCE_FREEZE			= 0,
+	METROPOLICE_SENTENCE_HES_OVER_HERE	= 1,
+	METROPOLICE_SENTENCE_HES_RUNNING	= 2,
+	METROPOLICE_SENTENCE_TAKE_HIM_DOWN	= 3,	
+	METROPOLICE_SENTENCE_ARREST_IN_POSITION	= 4,
+	METROPOLICE_SENTENCE_DEPLOY_MANHACK	= 5,
+	METROPOLICE_SENTENCE_MOVE_INTO_POSITION	= 6,
+	METROPOLICE_SENTENCE_HEARD_SOMETHING	= 7,
+};
+
+enum
+{
+	METROPOLICE_ANNOUNCE_ATTACK_PRIMARY = 1,
+	METROPOLICE_ANNOUNCE_ATTACK_SECONDARY,
+	METROPOLICE_ANNOUNCE_ATTACK_HARASS,
+};
+
+enum
+{
+	METROPOLICE_CHATTER_WAIT_FOR_RESPONSE = 0,
+	METROPOLICE_CHATTER_ASK_QUESTION = 1,
+	METROPOLICE_CHATTER_RESPONSE = 2,
+
+	METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT = 2,
+};
 
 
-int g_fCombineQuestion;				// true if an idle grunt asked a question. Cleared when someone answers. YUCK old global from grunt code
+enum SpeechMemory_t
+{
+	bits_MEMORY_PAIN_LIGHT_SOUND	= bits_MEMORY_CUSTOM1,
+	bits_MEMORY_PAIN_HEAVY_SOUND	= bits_MEMORY_CUSTOM2,
+	bits_MEMORY_PLAYER_HURT			= bits_MEMORY_CUSTOM3,
+	bits_MEMORY_PLAYER_HARASSED		= bits_MEMORY_CUSTOM4,
+};
+
+//Metrocop
+int	g_interactionMetrocopStartedStitch = 0;
+int g_interactionMetrocopIdleChatter = 0;
+int g_interactionMetrocopClearSentenceQueues = 0;
+
+extern int g_interactionHitByPlayerThrownPhysObj;
+
+ConVar	sk_metropolice_stitch_reaction( "sk_metropolice_stitch_reaction","1.0");
+ConVar	sk_metropolice_stitch_tight_hitcount( "sk_metropolice_stitch_tight_hitcount","2");
+ConVar	sk_metropolice_stitch_at_hitcount( "sk_metropolice_stitch_at_hitcount","1");
+ConVar	sk_metropolice_stitch_behind_hitcount( "sk_metropolice_stitch_behind_hitcount","3");
+ConVar	sk_metropolice_stitch_along_hitcount( "sk_metropolice_stitch_along_hitcount","2");
+
+
+ConVar	sk_metropolice_health( "sk_metropolice_health","0");
+ConVar	sk_metropolice_simple_health( "sk_metropolice_simple_health","26");
+ConVar	sk_metropolice_stitch_distance( "sk_metropolice_stitch_distance","1000");
+
+ConVar	metropolice_chase_use_follow( "metropolice_chase_use_follow", "0" );
+ConVar  metropolice_move_and_melee("metropolice_move_and_melee", "1" );
+ConVar  metropolice_charge("metropolice_charge", "1" );
 
 #ifdef MAPBASE
-ConVar npc_combine_idle_walk_easy("npc_combine_idle_walk_easy", "1", FCVAR_NONE, "Mapbase: Allows Combine soldiers to use ACT_WALK_EASY as a walking animation when idle.");
-ConVar npc_combine_unarmed_anims("npc_combine_unarmed_anims", "1", FCVAR_NONE, "Mapbase: Allows Combine soldiers to use unarmed idle/walk animations when they have no weapon.");
-ConVar npc_combine_protected_run("npc_combine_protected_run", "0", FCVAR_NONE, "Mapbase: Allows Combine soldiers to use \"protected run\" animations.");
-ConVar npc_combine_altfire_not_allies_only("npc_combine_altfire_not_allies_only", "1", FCVAR_NONE, "Mapbase: Elites are normally only allowed to fire their alt-fire attack at the player and the player's allies; This allows elites to alt-fire at other enemies too.");
-
-ConVar npc_combine_new_cover_behavior("npc_combine_new_cover_behavior", "1", FCVAR_NONE, "Mapbase: Toggles small patches for parts of npc_combine AI related to soldiers failing to take cover. These patches are minimal and only change cases where npc_combine would otherwise look at an enemy without shooting or run up to the player to melee attack when they don't have to. Consult the Mapbase wiki for more information.");
-
-ConVar npc_combine_fixed_shootpos("npc_combine_fixed_shootpos", "0", FCVAR_NONE, "Mapbase: Toggles fixed Combine soldier shoot position.");
+ConVar	metropolice_new_component_behavior("metropolice_new_component_behavior", "1");
 #endif
 
-#define COMBINE_SKIN_DEFAULT		0
-#define COMBINE_SKIN_SHOTGUNNER		1
+// How many clips of pistol ammo a metropolice carries.
+#define METROPOLICE_NUM_CLIPS			5
+#define METROPOLICE_BURST_RELOAD_COUNT	20
 
-
-#ifndef MAPBASE
-#define COMBINE_GRENADE_THROW_SPEED 650
-#define COMBINE_GRENADE_TIMER		3.5
-#define COMBINE_GRENADE_FLUSH_TIME	3.0		// Don't try to flush an enemy who has been out of sight for longer than this.
-#define COMBINE_GRENADE_FLUSH_DIST	256.0	// Don't try to flush an enemy who has moved farther than this distance from the last place I saw him.
-#endif
-
-#define COMBINE_LIMP_HEALTH				20
-#ifndef MAPBASE
-#define	COMBINE_MIN_GRENADE_CLEAR_DIST	250
-#endif
-
-#define COMBINE_EYE_STANDING_POSITION	Vector( 0, 0, 66 )
-#define COMBINE_GUN_STANDING_POSITION	Vector( 0, 0, 57 )
-#define COMBINE_EYE_CROUCHING_POSITION	Vector( 0, 0, 40 )
-#define COMBINE_GUN_CROUCHING_POSITION	Vector( 0, 0, 36 )
-#define COMBINE_SHOTGUN_STANDING_POSITION	Vector( 0, 0, 36 )
-#define COMBINE_SHOTGUN_CROUCHING_POSITION	Vector( 0, 0, 36 )
-#define COMBINE_MIN_CROUCH_DISTANCE		256.0
-
-//-----------------------------------------------------------------------------
-// Static stuff local to this file.
-//-----------------------------------------------------------------------------
-// This is the index to the name of the shotgun's classname in the string pool
-// so that we can get away with an integer compare rather than a string compare.
-#ifdef MAPBASE
-#define s_iszShotgunClassname gm_isz_class_Shotgun
-#else
-string_t	s_iszShotgunClassname;
-#endif
-
-//-----------------------------------------------------------------------------
-// Interactions
-//-----------------------------------------------------------------------------
-int	g_interactionCombineBash = 0; // melee bash attack
-
-//=========================================================
-// Combines's Anim Events Go Here
-//=========================================================
-#define COMBINE_AE_RELOAD			( 2 )
-#define COMBINE_AE_KICK				( 3 )
-#define COMBINE_AE_AIM				( 4 )
-#ifndef MAPBASE
-#define COMBINE_AE_GREN_TOSS		( 7 )
-#endif
-#define COMBINE_AE_GREN_LAUNCH		( 8 )
-#define COMBINE_AE_GREN_DROP		( 9 )
-#define COMBINE_AE_CAUGHT_ENEMY		( 10) // grunt established sight with an enemy (player only) that had previously eluded the squad.
-
-#ifndef MAPBASE
-int COMBINE_AE_BEGIN_ALTFIRE;
-int COMBINE_AE_ALTFIRE;
-#endif
-
-//=========================================================
-// Combine activities
-//=========================================================
-//Activity ACT_COMBINE_STANDING_SMG1;
-//Activity ACT_COMBINE_CROUCHING_SMG1;
-//Activity ACT_COMBINE_STANDING_AR2;
-//Activity ACT_COMBINE_CROUCHING_AR2;
-//Activity ACT_COMBINE_WALKING_AR2;
-//Activity ACT_COMBINE_STANDING_SHOTGUN;
-//Activity ACT_COMBINE_CROUCHING_SHOTGUN;
-#if !SHARED_COMBINE_ACTIVITIES
-Activity ACT_COMBINE_THROW_GRENADE;
-#endif
-Activity ACT_COMBINE_LAUNCH_GRENADE;
-Activity ACT_COMBINE_BUGBAIT;
-#if !SHARED_COMBINE_ACTIVITIES
-Activity ACT_COMBINE_AR2_ALTFIRE;
-#endif
-Activity ACT_WALK_EASY;
-Activity ACT_WALK_MARCH;
-#ifdef MAPBASE
-Activity ACT_TURRET_CARRY_IDLE;
-Activity ACT_TURRET_CARRY_WALK;
-Activity ACT_TURRET_CARRY_RUN;
-#endif
+int AE_METROPOLICE_BATON_ON;
+int	AE_METROPOLICE_BATON_OFF;
+int AE_METROPOLICE_SHOVE;
+int AE_METROPOLICE_START_DEPLOY;
+int AE_METROPOLICE_DRAW_PISTOL;		// was	50
+int AE_METROPOLICE_DEPLOY_MANHACK;	// was	51
 
 // -----------------------------------------------
 //	> Squad slots
 // -----------------------------------------------
 enum SquadSlot_T
 {
-	SQUAD_SLOT_GRENADE1 = LAST_SHARED_SQUADSLOT,
-	SQUAD_SLOT_GRENADE2,
-	SQUAD_SLOT_ATTACK_OCCLUDER,
-	SQUAD_SLOT_OVERWATCH,
+	SQUAD_SLOT_POLICE_CHARGE_ENEMY = LAST_SHARED_SQUADSLOT,
+	SQUAD_SLOT_POLICE_HARASS, // Yell at the player with a megaphone, etc.
+	SQUAD_SLOT_POLICE_DEPLOY_MANHACK,
+	SQUAD_SLOT_POLICE_ADVANCE,
+	SQUAD_SLOT_POLICE_ATTACK_OCCLUDER1,
+	SQUAD_SLOT_POLICE_ATTACK_OCCLUDER2,
+	SQUAD_SLOT_POLICE_COVERING_FIRE1,
+	SQUAD_SLOT_POLICE_COVERING_FIRE2,
+	SQUAD_SLOT_POLICE_ARREST_ENEMY,
 };
 
-enum TacticalVariant_T
-{
-	TACTICAL_VARIANT_DEFAULT = 0,
-	TACTICAL_VARIANT_PRESSURE_ENEMY,				// Always try to close in on the player.
-	TACTICAL_VARIANT_PRESSURE_ENEMY_UNTIL_CLOSE,	// Act like VARIANT_PRESSURE_ENEMY, but go to VARIANT_DEFAULT once within 30 feet
+//=========================================================
+// Metro Police  Activities
+//=========================================================
+int ACT_METROPOLICE_DRAW_PISTOL;
+int ACT_METROPOLICE_DEPLOY_MANHACK;
+int ACT_METROPOLICE_FLINCH_BEHIND;
+
+int	ACT_WALK_BATON;
+int	ACT_IDLE_ANGRY_BATON;
+int	ACT_PUSH_PLAYER;
+int ACT_MELEE_ATTACK_THRUST;
+int ACT_ACTIVATE_BATON;
+int ACT_DEACTIVATE_BATON;
+ 
+LINK_ENTITY_TO_CLASS( npc_metropolice, CNPC_MetroPolice );
+
+BEGIN_DATADESC( CNPC_MetroPolice )
+
+	DEFINE_EMBEDDED( m_BatonSwingTimer ),	
+	DEFINE_EMBEDDED( m_NextChargeTimer ),
+	DEFINE_FIELD( m_flBatonDebounceTime, FIELD_FLOAT ),
+	DEFINE_FIELD( m_bShouldActivateBaton, FIELD_BOOLEAN ),
+	DEFINE_FIELD( m_iPistolClips, FIELD_INTEGER ),
+	DEFINE_KEYFIELD( m_fWeaponDrawn, FIELD_BOOLEAN, "weapondrawn" ),
+	DEFINE_FIELD( m_LastShootSlot, FIELD_INTEGER ),
+	DEFINE_EMBEDDED( m_TimeYieldShootSlot ),
+#ifndef METROPOLICE_USES_RESPONSE_SYSTEM
+	DEFINE_EMBEDDED( m_Sentences ),
+#endif
+	DEFINE_FIELD( m_bPlayerIsNear, FIELD_BOOLEAN ),
+
+	DEFINE_FIELD( m_vecBurstTargetPos, FIELD_POSITION_VECTOR ),
+	DEFINE_FIELD( m_vecBurstDelta, FIELD_VECTOR ),
+	DEFINE_FIELD( m_nBurstHits, FIELD_INTEGER ),
+	DEFINE_FIELD( m_nMaxBurstHits, FIELD_INTEGER ),
+	DEFINE_FIELD( m_flBurstPredictTime, FIELD_TIME ),
+	DEFINE_FIELD( m_nBurstReloadCount, FIELD_INTEGER ),
+	DEFINE_FIELD( m_vecBurstLineOfDeathDelta, FIELD_VECTOR ),
+	DEFINE_FIELD( m_vecBurstLineOfDeathOrigin, FIELD_POSITION_VECTOR ),
+	DEFINE_FIELD( m_flBurstSteerDistance, FIELD_FLOAT ),
+	DEFINE_FIELD( m_nBurstMode, FIELD_INTEGER ),
+	DEFINE_FIELD( m_nBurstSteerMode, FIELD_INTEGER ),
+	DEFINE_FIELD( m_vecBurstPredictedVelocityDir, FIELD_VECTOR ),
+	DEFINE_FIELD( m_vecBurstPredictedSpeed, FIELD_FLOAT ),
+	DEFINE_FIELD( m_flValidStitchTime, FIELD_TIME ),
+	DEFINE_FIELD( m_flNextLedgeCheckTime, FIELD_TIME ),
+	DEFINE_FIELD( m_flTaskCompletionTime, FIELD_TIME ),
+	DEFINE_FIELD( m_flLastPhysicsFlinchTime, FIELD_TIME ),
+	DEFINE_FIELD( m_flLastDamageFlinchTime, FIELD_TIME ),
+
+	DEFINE_FIELD( m_hManhack, FIELD_EHANDLE ),
+	DEFINE_FIELD( m_hBlockingProp, FIELD_EHANDLE ),
+
+	DEFINE_FIELD( m_nRecentDamage, FIELD_INTEGER ),
+	DEFINE_FIELD( m_flRecentDamageTime, FIELD_TIME ),
+
+	DEFINE_FIELD( m_flNextPainSoundTime, FIELD_TIME ),
+	DEFINE_FIELD( m_flNextLostSoundTime, FIELD_TIME ),
+	DEFINE_FIELD( m_nIdleChatterType, FIELD_INTEGER ),
+
+	DEFINE_FIELD( m_bSimpleCops, FIELD_BOOLEAN ),
+	DEFINE_FIELD( m_flLastHitYaw, FIELD_FLOAT ),
+
+	DEFINE_FIELD( m_bPlayerTooClose,	FIELD_BOOLEAN ),
+	DEFINE_FIELD( m_bKeepFacingPlayer,	FIELD_BOOLEAN ),
+	DEFINE_FIELD( m_flChasePlayerTime,	FIELD_TIME ),
+	DEFINE_FIELD( m_vecPreChaseOrigin,	FIELD_VECTOR ),
+	DEFINE_FIELD( m_flPreChaseYaw,		FIELD_FLOAT ),
+	DEFINE_FIELD( m_nNumWarnings,		FIELD_INTEGER ),
+	DEFINE_FIELD( m_iNumPlayerHits,		FIELD_INTEGER ),
+
+	//								m_ActBusyBehavior (auto saved by AI)
+	//								m_StandoffBehavior (auto saved by AI)
+	//								m_AssaultBehavior (auto saved by AI)
+	//								m_FuncTankBehavior (auto saved by AI)
+	//								m_RappelBehavior (auto saved by AI)
+	//								m_PolicingBehavior (auto saved by AI)
+	//								m_FollowBehavior (auto saved by AI)
+
+	DEFINE_KEYFIELD( m_iManhacks, FIELD_INTEGER, "manhacks" ),
+	DEFINE_INPUTFUNC( FIELD_VOID, "EnableManhackToss", InputEnableManhackToss ),
 #ifdef MAPBASE
-	TACTICAL_VARIANT_GRENADE_HAPPY,					// Throw grenades as if you're fighting a turret
+	DEFINE_INPUTFUNC( FIELD_VOID, "DisableManhackToss", InputDisableManhackToss ),
+	DEFINE_INPUTFUNC( FIELD_VOID, "DeployManhack", InputDeployManhack ),
+	DEFINE_INPUTFUNC( FIELD_INTEGER, "AddManhacks", InputAddManhacks ),
+	DEFINE_INPUTFUNC( FIELD_INTEGER, "SetManhacks", InputSetManhacks ),
 #endif
-};
-
-enum PathfindingVariant_T
-{
-	PATHFINDING_VARIANT_DEFAULT = 0,
-};
-
-
-#define bits_MEMORY_PAIN_LIGHT_SOUND		bits_MEMORY_CUSTOM1
-#define bits_MEMORY_PAIN_HEAVY_SOUND		bits_MEMORY_CUSTOM2
-#define bits_MEMORY_PLAYER_HURT				bits_MEMORY_CUSTOM3
-
-LINK_ENTITY_TO_CLASS(npc_combine, CNPC_Combine);
-
-//---------------------------------------------------------
-// Save/Restore
-//---------------------------------------------------------
-BEGIN_DATADESC(CNPC_Combine)
-
-DEFINE_FIELD(m_nKickDamage, FIELD_INTEGER),
-DEFINE_FIELD(m_vecTossVelocity, FIELD_VECTOR),
-#ifndef MAPBASE
-DEFINE_FIELD(m_hForcedGrenadeTarget, FIELD_EHANDLE),
+	DEFINE_INPUTFUNC( FIELD_STRING, "SetPoliceGoal", InputSetPoliceGoal ),
+	DEFINE_INPUTFUNC( FIELD_VOID, "ActivateBaton", InputActivateBaton ),
+#ifdef MAPBASE
+	DEFINE_INPUTFUNC( FIELD_VOID, "AdministerJustice", InputAdministerJustice ),
+	DEFINE_INPUTFUNC( FIELD_INTEGER, "AddWarnings", InputAddWarnings ),
+	DEFINE_INPUTFUNC( FIELD_INTEGER, "SetWarnings", InputSetWarnings ),
 #endif
-DEFINE_FIELD(m_bShouldPatrol, FIELD_BOOLEAN),
-DEFINE_FIELD(m_bFirstEncounter, FIELD_BOOLEAN),
-DEFINE_FIELD(m_flNextPainSoundTime, FIELD_TIME),
-DEFINE_FIELD(m_flNextAlertSoundTime, FIELD_TIME),
-#ifndef MAPBASE
-DEFINE_FIELD(m_flNextGrenadeCheck, FIELD_TIME),
-#endif
-DEFINE_FIELD(m_flNextLostSoundTime, FIELD_TIME),
-DEFINE_FIELD(m_flAlertPatrolTime, FIELD_TIME),
-#ifndef MAPBASE
-DEFINE_FIELD(m_flNextAltFireTime, FIELD_TIME),
-#endif
-DEFINE_FIELD(m_nShots, FIELD_INTEGER),
-DEFINE_FIELD(m_flShotDelay, FIELD_FLOAT),
-DEFINE_FIELD(m_flStopMoveShootTime, FIELD_TIME),
-#ifndef MAPBASE // See ai_grenade.h
-DEFINE_KEYFIELD(m_iNumGrenades, FIELD_INTEGER, "NumGrenades"),
-#else
-DEFINE_INPUT(m_bUnderthrow, FIELD_BOOLEAN, "UnderthrowGrenades"),
-DEFINE_INPUT(m_bAlternateCapable, FIELD_BOOLEAN, "SetAlternateCapable"),
-#endif
-#ifndef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-DEFINE_EMBEDDED(m_Sentences),
+	
+	DEFINE_USEFUNC( PrecriminalUse ),
+
+	DEFINE_OUTPUT( m_OnStunnedPlayer,	"OnStunnedPlayer" ),
+	DEFINE_OUTPUT( m_OnCupCopped, "OnCupCopped" ),
+#ifdef MAPBASE
+	DEFINE_OUTPUT( m_OnHitByPhysicsObject, "OnHitByPhysicsObject" ),
+	DEFINE_OUTPUT( m_OutManhack, "OutManhack" ),
 #endif
 
-//							m_AssaultBehavior (auto saved by AI)
-//							m_StandoffBehavior (auto saved by AI)
-//							m_FollowBehavior (auto saved by AI)
-//							m_FuncTankBehavior (auto saved by AI)
-//							m_RappelBehavior (auto saved by AI)
-//							m_ActBusyBehavior (auto saved by AI)
-
-DEFINE_INPUTFUNC(FIELD_VOID, "LookOff", InputLookOff),
-DEFINE_INPUTFUNC(FIELD_VOID, "LookOn", InputLookOn),
-
-DEFINE_INPUTFUNC(FIELD_VOID, "StartPatrolling", InputStartPatrolling),
-DEFINE_INPUTFUNC(FIELD_VOID, "StopPatrolling", InputStopPatrolling),
-
-DEFINE_INPUTFUNC(FIELD_STRING, "Assault", InputAssault),
-
-DEFINE_INPUTFUNC(FIELD_VOID, "HitByBugbait", InputHitByBugbait),
-
-#ifndef MAPBASE
-DEFINE_INPUTFUNC(FIELD_STRING, "ThrowGrenadeAtTarget", InputThrowGrenadeAtTarget),
-#else
-DEFINE_INPUTFUNC(FIELD_BOOLEAN, "SetElite", InputSetElite),
-
-DEFINE_INPUTFUNC(FIELD_VOID, "DropGrenade", InputDropGrenade),
-
-DEFINE_INPUTFUNC(FIELD_INTEGER, "SetTacticalVariant", InputSetTacticalVariant),
-
-DEFINE_INPUTFUNC(FIELD_STRING, "SetPoliceGoal", InputSetPoliceGoal),
-
-DEFINE_AIGRENADE_DATADESC()
+#ifdef MAPBASE
+	DEFINE_AIGRENADE_DATADESC()
+	DEFINE_INPUT( m_iGrenadeCapabilities, FIELD_INTEGER, "SetGrenadeCapabilities" ),
+	DEFINE_INPUT( m_iGrenadeDropCapabilities, FIELD_INTEGER, "SetGrenadeDropCapabilities" ),
 #endif
-
-#ifndef MAPBASE
-DEFINE_FIELD(m_iLastAnimEventHandled, FIELD_INTEGER),
-#endif
-DEFINE_FIELD(m_fIsElite, FIELD_BOOLEAN),
-#ifndef MAPBASE
-DEFINE_FIELD(m_vecAltFireTarget, FIELD_VECTOR),
-#endif
-
-DEFINE_KEYFIELD(m_iTacticalVariant, FIELD_INTEGER, "tacticalvariant"),
-DEFINE_KEYFIELD(m_iPathfindingVariant, FIELD_INTEGER, "pathfindingvariant"),
 
 END_DATADESC()
 
 
-//------------------------------------------------------------------------------
-// Constructor.
-//------------------------------------------------------------------------------
-CNPC_Combine::CNPC_Combine()
-{
-	m_vecTossVelocity = vec3_origin;
 
-	// [MODIFICATION] Initialize all custom state variables to their default values.
+
+//------------------------------------------------------------------------------
+
+float CNPC_MetroPolice::gm_flTimeLastSpokePeek;
+
+//------------------------------------------------------------------------------
+// Purpose 
+//------------------------------------------------------------------------------
+CBaseEntity *CNPC_MetroPolice::CheckTraceHullAttack( float flDist, const Vector &mins, const Vector &maxs, int iDamage, int iDmgType, float forceScale, bool bDamageAnyNPC )
+{
+	// If only a length is given assume we want to trace in our facing direction
+	Vector forward;
+	AngleVectors( GetAbsAngles(), &forward );
+	Vector vStart = GetAbsOrigin();
+
+	// The ideal place to start the trace is in the center of the attacker's bounding box.
+	// however, we need to make sure there's enough clearance. Some of the smaller monsters aren't 
+	// as big as the hull we try to trace with. (SJB)
+	float flVerticalOffset = WorldAlignSize().z * 0.5;
+
+	if( flVerticalOffset < maxs.z )
+	{
+		// There isn't enough room to trace this hull, it's going to drag the ground.
+		// so make the vertical offset just enough to clear the ground.
+		flVerticalOffset = maxs.z + 1.0;
+	}
+
+	vStart.z += flVerticalOffset;
+	Vector vEnd = vStart + (forward * flDist );
+	return CheckTraceHullAttack( vStart, vEnd, mins, maxs, iDamage, iDmgType, forceScale, bDamageAnyNPC );
+}
+
+//------------------------------------------------------------------------------
+// Melee filter for police
+//------------------------------------------------------------------------------
+class CTraceFilterMetroPolice : public CTraceFilterEntitiesOnly
+{
+public:
+	// It does have a base, but we'll never network anything below here..
+	DECLARE_CLASS_NOBASE( CTraceFilterMetroPolice );
 	
-	m_bIsReturningGrenade = false;		// [MODIFICATION] State flag for the ability. Must start false. Without it, the AI could spawn with the flag true, permanently blocking its ability to throw grenades.
+	CTraceFilterMetroPolice( const IHandleEntity *passentity, int collisionGroup, CTakeDamageInfo *dmgInfo, float flForceScale, bool bDamageAnyNPC )
+		: m_pPassEnt(passentity), m_collisionGroup(collisionGroup), m_dmgInfo(dmgInfo), m_pHit(NULL), m_flForceScale(flForceScale), m_bDamageAnyNPC(bDamageAnyNPC)
+	{
+	}
+	
+	virtual bool ShouldHitEntity( IHandleEntity *pHandleEntity, int contentsMask )
+	{
+		if ( !StandardFilterRules( pHandleEntity, contentsMask ) )
+			return false;
+
+		if ( !PassServerEntityFilter( pHandleEntity, m_pPassEnt ) )
+			return false;
+
+		// Don't test if the game code tells us we should ignore this collision...
+		CBaseEntity *pEntity = EntityFromEntityHandle( pHandleEntity );
+		
+		if ( pEntity )
+		{
+			if ( !pEntity->ShouldCollide( m_collisionGroup, contentsMask ) )
+				return false;
+			
+			if ( !g_pGameRules->ShouldCollide( m_collisionGroup, pEntity->GetCollisionGroup() ) )
+				return false;
+
+			if ( pEntity->m_takedamage == DAMAGE_NO )
+				return false;
+
+			// Translate the vehicle into its driver for damage
+			if ( pEntity->GetServerVehicle() != NULL )
+			{
+				CBaseEntity *pDriver = pEntity->GetServerVehicle()->GetPassenger();
+
+				if ( pDriver != NULL )
+				{
+					pEntity = pDriver;
+				}
+			}
+	
+			Vector	attackDir = pEntity->WorldSpaceCenter() - m_dmgInfo->GetAttacker()->WorldSpaceCenter();
+			VectorNormalize( attackDir );
+
+			CTakeDamageInfo info = (*m_dmgInfo);				
+			CalculateMeleeDamageForce( &info, attackDir, info.GetAttacker()->WorldSpaceCenter(), m_flForceScale );
+
+			if( !(pEntity->GetFlags() & FL_ONGROUND) )
+			{
+				// Don't hit airborne entities so hard. They fly farther since
+				// there's no friction with the ground.
+				info.ScaleDamageForce( 0.001 );
+			}
+
+			CBaseCombatCharacter *pBCC = info.GetAttacker()->MyCombatCharacterPointer();
+			CBaseCombatCharacter *pVictimBCC = pEntity->MyCombatCharacterPointer();
+
+			// Only do these comparisons between NPCs
+			if ( pBCC && pVictimBCC )
+			{
+				// Can only damage other NPCs that we hate
+#ifdef MAPBASE
+				if ( m_bDamageAnyNPC || pBCC->IRelationType( pEntity ) <= D_FR || pEntity->IsPlayer() )
+#else
+				if ( m_bDamageAnyNPC || pBCC->IRelationType( pEntity ) == D_HT || pEntity->IsPlayer() )
+#endif
+				{
+					if ( info.GetDamage() )
+					{
+						// If gordon's a criminal, do damage now
+						if ( !pEntity->IsPlayer() || GlobalEntity_GetState( "gordon_precriminal" ) == GLOBAL_OFF )
+						{
+							if ( pEntity->IsPlayer() && ((CBasePlayer *)pEntity)->IsSuitEquipped() )
+							{
+								info.ScaleDamage( .25 );
+								info.ScaleDamageForce( .25 );
+							}
+
+							pEntity->TakeDamage( info );
+						}
+					}
+					
+					m_pHit = pEntity;
+					return true;
+				}
+			}
+			else
+			{
+				// Make sure if the player is holding this, he drops it
+				Pickup_ForcePlayerToDropThisObject( pEntity );
+
+				// Otherwise just damage passive objects in our way
+				if ( info.GetDamage() )
+				{
+					pEntity->TakeDamage( info );
+				}
+			}
+		}
+
+		return false;
+	}
+
+public:
+	const IHandleEntity *m_pPassEnt;
+	int					m_collisionGroup;
+	CTakeDamageInfo		*m_dmgInfo;
+	CBaseEntity			*m_pHit;
+	float				m_flForceScale;
+	bool				m_bDamageAnyNPC;
+};
+
+//------------------------------------------------------------------------------
+// Purpose :	start and end trace position, amount 
+//				of damage to do, and damage type. Returns a pointer to
+//				the damaged entity in case the NPC wishes to do
+//				other stuff to the victim (punchangle, etc)
+//
+//				Used for many contact-range melee attacks. Bites, claws, etc.
+// Input   :
+// Output  :
+//------------------------------------------------------------------------------
+CBaseEntity *CNPC_MetroPolice::CheckTraceHullAttack( const Vector &vStart, const Vector &vEnd, const Vector &mins, const Vector &maxs, int iDamage, int iDmgType, float flForceScale, bool bDamageAnyNPC )
+{
+
+	CTakeDamageInfo	dmgInfo( this, this, iDamage, DMG_SLASH );
+	
+	CTraceFilterMetroPolice traceFilter( this, COLLISION_GROUP_NONE, &dmgInfo, flForceScale, bDamageAnyNPC );
+
+	Ray_t ray;
+	ray.Init( vStart, vEnd, mins, maxs );
+
+	trace_t tr;
+	enginetrace->TraceRay( ray, MASK_SHOT, &traceFilter, &tr );
+
+	CBaseEntity *pEntity = traceFilter.m_pHit;
+	
+	if ( pEntity == NULL )
+	{
+		// See if perhaps I'm trying to claw/bash someone who is standing on my head.
+		Vector vecTopCenter;
+		Vector vecEnd;
+		Vector vecMins, vecMaxs;
+
+		// Do a tracehull from the top center of my bounding box.
+		vecTopCenter = GetAbsOrigin();
+		CollisionProp()->WorldSpaceAABB( &vecMins, &vecMaxs );
+		vecTopCenter.z = vecMaxs.z + 1.0f;
+		vecEnd = vecTopCenter;
+		vecEnd.z += 2.0f;
+		
+		ray.Init( vecTopCenter, vEnd, mins, maxs );
+		enginetrace->TraceRay( ray, MASK_SHOT_HULL, &traceFilter, &tr );
+
+		pEntity = traceFilter.m_pHit;
+	}
+
+	return pEntity;
+}
+
+//-----------------------------------------------------------------------------
+// My buddies got killed!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::NotifyDeadFriend( CBaseEntity* pFriend )
+{
+	BaseClass::NotifyDeadFriend(pFriend);
+
+#ifdef MAPBASE
+	// m_hManhack is set to NULL after it's finished deploying, which means this has no chance of playing unless the manhack
+	// was still being deployed. This is thought to be an unintended oversight.
+	// Mapbase stores the metrocop thrower as the manhack's owner entity, so this code is now able to check that instead.
+	if ( pFriend->GetOwnerEntity() == this )
+#else
+	if ( pFriend == m_hManhack )
+#endif
+	{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+		SpeakIfAllowed(TLK_COP_MANHACKKILLED, "my_manhack:1", SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL);
+#else
+		m_Sentences.Speak( "METROPOLICE_MANHACK_KILLED", SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL );
+#endif
+		DevMsg("My manhack died!\n");
+		m_hManhack = NULL;
+		return;
+	}
+
+	// No notifications for squadmates' dead manhacks
+	if ( FClassnameIs( pFriend, "npc_manhack" ) )
+		return;
+
+	// Reset idle chatter, we may never get a response back
+	if ( m_nIdleChatterType == METROPOLICE_CHATTER_WAIT_FOR_RESPONSE )
+	{
+		m_nIdleChatterType = METROPOLICE_CHATTER_ASK_QUESTION;
+	}
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	SpeakIfAllowed(TLK_COP_MANDOWN, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL);
+#else
+	if ( GetSquad()->NumMembers() < 2 )
+	{
+		m_Sentences.Speak( "METROPOLICE_LAST_OF_SQUAD", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+		return;
+	}
+
+	m_Sentences.Speak( "METROPOLICE_MAN_DOWN", SENTENCE_PRIORITY_MEDIUM );
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+CNPC_MetroPolice::CNPC_MetroPolice()
+{
+	// [MODIFICATION] Initialize all custom state variables to their default values.
+
 	m_flNextGrenadeCatchTime = 0;		// [MODIFICATION] Cooldown timer. Starts at 0. Without it, the ability could be on cooldown when the NPC spawns.
 	m_bForceFastTurn = false;			// [MODIFICATION] "Turbo turn" flag. Starts false. Without it, the AI would have maximum turn speed at all times.
+
+
+#ifdef MAPBASE
+	m_iGrenadeCapabilities = GRENCAP_GRENADE;
+
+
+	if (ai_grenade_always_drop.GetBool())
+	{
+		m_iGrenadeDropCapabilities = (eGrenadeDropCapabilities)(GRENDROPCAP_GRENADE | GRENDROPCAP_ALTFIRE | GRENDROPCAP_INTERRUPTED);
+	}
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnScheduleChange()
+{
+	BaseClass::OnScheduleChange();
+
+#ifndef MAPBASE // Moved to Event_KilledOther()
+	if ( GetEnemy() && HasCondition( COND_ENEMY_DEAD ) )
+	{
+		AnnounceEnemyKill( GetEnemy() );
+	}
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::PrescheduleThink( void )
+{
+	BaseClass::PrescheduleThink();
+
+#ifndef METROPOLICE_USES_RESPONSE_SYSTEM
+	// Speak any queued sentences
+	m_Sentences.UpdateSentenceQueue();
+#endif
+
+	// Look at near players, always
+	m_bPlayerIsNear = false;
+	if ( PlayerIsCriminal() == false )
+	{
+		CBasePlayer *pPlayer = UTIL_PlayerByIndex( 1 );
+		
+		if ( pPlayer && ( pPlayer->WorldSpaceCenter() - WorldSpaceCenter() ).LengthSqr() < (128*128) )
+		{
+			m_bPlayerIsNear = true;
+			AddLookTarget( pPlayer, 0.75f, 5.0f );
+			
+			if ( ( m_PolicingBehavior.IsEnabled() == false ) && ( m_nNumWarnings >= METROPOLICE_MAX_WARNINGS ) )
+			{
+				m_flBatonDebounceTime = gpGlobals->curtime + random->RandomFloat( 2.5f, 4.0f );
+				SetTarget( pPlayer );
+				SetBatonState( true );
+			}
+		}
+		else 
+		{
+			if ( m_PolicingBehavior.IsEnabled() == false && gpGlobals->curtime > m_flBatonDebounceTime )
+			{
+				SetBatonState( false );
+			}
+
+			m_bKeepFacingPlayer = false;
+		}
+	}
+
+	if( IsOnFire() )
+	{
+		SetCondition( COND_METROPOLICE_ON_FIRE );
+	}
+	else
+	{
+		ClearCondition( COND_METROPOLICE_ON_FIRE );
+	}
+
+	if (gpGlobals->curtime > m_flRecentDamageTime + RECENT_DAMAGE_INTERVAL)
+	{
+		m_nRecentDamage = 0;
+		m_flRecentDamageTime = 0;
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &move - 
+//			flInterval - 
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::OverrideMoveFacing( const AILocalMoveGoal_t &move, float flInterval )
+{
+	// Don't do this if we're scripted
+	if ( IsInAScript() )
+		return BaseClass::OverrideMoveFacing( move, flInterval );
+  	
+	// ROBIN: Disabled at request of mapmakers for now
+	/*
+  	// If we're moving during a police sequence, always face our target
+	if ( m_PolicingBehavior.IsEnabled() )
+  	{	
+		CBaseEntity *pTarget = m_PolicingBehavior.GetGoalTarget();
+
+		if ( pTarget )
+		{
+			AddFacingTarget( pTarget, pTarget->WorldSpaceCenter(), 1.0f, 0.2f );
+		}
+	}
+	*/
+
+	return BaseClass::OverrideMoveFacing( move, flInterval );
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::Precache( void )
+{
+#ifdef MAPBASE
+	// It doesn't matter if we can't find models/police.mdl in the string pool because then we know this NPC doesn't have that model.
+	if ( GetModelName() == NULL_STRING || GetModelName() == FindPooledString("models/police.mdl") )
+	{
+#endif
+	if ( HasSpawnFlags( SF_NPC_START_EFFICIENT ) )
+	{
+		SetModelName( AllocPooledString("models/police_cheaple.mdl" ) );
+	}
+	else
+	{
+		SetModelName( AllocPooledString("models/police.mdl") );
+	}
+#ifdef MAPBASE
+	}
+#endif
+
+	PrecacheModel( STRING( GetModelName() ) );
+
+	UTIL_PrecacheOther( "npc_manhack" );
+
+	PrecacheScriptSound( "NPC_Metropolice.Shove" );
+	PrecacheScriptSound( "NPC_MetroPolice.WaterSpeech" );
+	PrecacheScriptSound( "NPC_MetroPolice.HidingSpeech" );
+	enginesound->PrecacheSentenceGroup( "METROPOLICE" );
+
+	BaseClass::Precache();
 }
 
 
 //-----------------------------------------------------------------------------
 // Create components
 //-----------------------------------------------------------------------------
-bool CNPC_Combine::CreateComponents()
+bool CNPC_MetroPolice::CreateComponents()
 {
-	if (!BaseClass::CreateComponents())
+	if ( !BaseClass::CreateComponents() )
 		return false;
 
-#ifndef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	m_Sentences.Init(this, "NPC_Combine.SentenceParameters");
+#ifndef METROPOLICE_USES_RESPONSE_SYSTEM
+	m_Sentences.Init( this, "NPC_Metropolice.SentenceParameters" );
 #endif
 	return true;
 }
 
 
-//------------------------------------------------------------------------------
-// Purpose: Don't look, only get info from squad.
-//------------------------------------------------------------------------------
-void CNPC_Combine::InputLookOff(inputdata_t& inputdata)
-{
-	m_spawnflags |= SF_COMBINE_NO_LOOK;
-}
-
-//------------------------------------------------------------------------------
-// Purpose: Enable looking.
-//------------------------------------------------------------------------------
-void CNPC_Combine::InputLookOn(inputdata_t& inputdata)
-{
-	m_spawnflags &= ~SF_COMBINE_NO_LOOK;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputStartPatrolling(inputdata_t& inputdata)
-{
-	m_bShouldPatrol = true;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputStopPatrolling(inputdata_t& inputdata)
-{
-	m_bShouldPatrol = false;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputAssault(inputdata_t& inputdata)
-{
-	m_AssaultBehavior.SetParameters(AllocPooledString(inputdata.value.String()), CUE_DONT_WAIT, RALLY_POINT_SELECT_DEFAULT);
-}
-
-//-----------------------------------------------------------------------------
-// We were hit by bugbait
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputHitByBugbait(inputdata_t& inputdata)
-{
-	SetCondition(COND_COMBINE_HIT_BY_BUGBAIT);
-}
-
-#ifndef MAPBASE
-//-----------------------------------------------------------------------------
-// Purpose: Force the combine soldier to throw a grenade at the target
-//			If I'm a combine elite, fire my combine ball at the target instead.
-// Input  : &inputdata - 
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputThrowGrenadeAtTarget(inputdata_t& inputdata)
-{
-	// Ignore if we're inside a scripted sequence
-	if (m_NPCState == NPC_STATE_SCRIPT && m_hCine)
-		return;
-
-#ifdef MAPBASE
-	CBaseEntity* pEntity = gEntList.FindEntityByName(NULL, inputdata.value.String(), this, inputdata.pActivator, inputdata.pCaller);
-#else
-	CBaseEntity* pEntity = gEntList.FindEntityByName(NULL, inputdata.value.String(), NULL, inputdata.pActivator, inputdata.pCaller);
-#endif
-	if (!pEntity)
-	{
-		DevMsg("%s (%s) received ThrowGrenadeAtTarget input, but couldn't find target entity '%s'\n", GetClassname(), GetDebugName(), inputdata.value.String());
-		return;
-	}
-
-	m_hForcedGrenadeTarget = pEntity;
-	m_flNextGrenadeCheck = 0;
-
-	ClearSchedule("Told to throw grenade via input");
-}
-#endif
-
-#ifdef MAPBASE
-//-----------------------------------------------------------------------------
-// Instant transformation of arsenal from grenades to energy balls, or vice versa
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputSetElite(inputdata_t& inputdata)
-{
-	m_fIsElite = inputdata.value.Bool();
-}
-
-//-----------------------------------------------------------------------------
-// We were told to drop a grenade
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputDropGrenade(inputdata_t& inputdata)
-{
-	SetCondition(COND_COMBINE_DROP_GRENADE);
-
-	ClearSchedule("Told to drop grenade via input");
-}
-
-//-----------------------------------------------------------------------------
-// Changes our tactical variant easily
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputSetTacticalVariant(inputdata_t& inputdata)
-{
-	m_iTacticalVariant = inputdata.value.Int();
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-// Input  : &inputdata - 
-//-----------------------------------------------------------------------------
-void CNPC_Combine::InputSetPoliceGoal(inputdata_t& inputdata)
-{
-	if (/*!inputdata.value.String() ||*/ inputdata.value.String()[0] == 0)
-	{
-		m_PolicingBehavior.Disable();
-		return;
-	}
-
-	CBaseEntity* pGoal = gEntList.FindEntityByName(NULL, inputdata.value.String());
-
-	if (pGoal == NULL)
-	{
-		DevMsg("SetPoliceGoal: %s (%s) unable to find ai_goal_police: %s\n", GetClassname(), GetDebugName(), inputdata.value.String());
-		return;
-	}
-
-	CAI_PoliceGoal* pPoliceGoal = dynamic_cast<CAI_PoliceGoal*>(pGoal);
-
-	if (pPoliceGoal == NULL)
-	{
-		DevMsg("SetPoliceGoal: %s (%s)'s target %s is not an ai_goal_police entity!\n", GetClassname(), GetDebugName(), inputdata.value.String());
-		return;
-	}
-
-	m_PolicingBehavior.Enable(pPoliceGoal);
-}
-#endif
-
-//-----------------------------------------------------------------------------
-// Purpose:
-//-----------------------------------------------------------------------------
-void CNPC_Combine::Precache()
-{
-	PrecacheModel("models/Weapons/w_grenade.mdl");
-	UTIL_PrecacheOther("npc_handgrenade");
-
-	PrecacheScriptSound("NPC_Combine.GrenadeLaunch");
-	PrecacheScriptSound("NPC_Combine.WeaponBash");
-#ifndef MAPBASE // Now that we use WeaponSound(SPECIAL1), this isn't necessary
-	PrecacheScriptSound("Weapon_CombineGuard.Special1");
-#endif
-
-	BaseClass::Precache();
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::Activate()
-{
-#ifndef MAPBASE
-	s_iszShotgunClassname = FindPooledString("weapon_shotgun");
-#endif
-	BaseClass::Activate();
-}
-
 //-----------------------------------------------------------------------------
 // Purpose: 
 //
 //
 //-----------------------------------------------------------------------------
-void CNPC_Combine::Spawn(void)
+void CNPC_MetroPolice::Spawn( void )
 {
+	Precache();
+
+#ifdef _XBOX
+	// Always fade the corpse
+	AddSpawnFlags( SF_NPC_FADE_CORPSE );
+#endif // _XBOX
+
+	SetModel( STRING( GetModelName() ) );
+
 	SetHullType(HULL_HUMAN);
 	SetHullSizeNormal();
 
-	SetSolid(SOLID_BBOX);
-	AddSolidFlags(FSOLID_NOT_STANDABLE);
-	SetMoveType(MOVETYPE_STEP);
-	SetBloodColor(BLOOD_COLOR_RED);
-	m_flFieldOfView = -0.2;// indicates the width of this NPC's forward view cone ( as a dotproduct result )
-	m_NPCState = NPC_STATE_NONE;
-	m_flNextGrenadeCheck = gpGlobals->curtime + 1;
-	m_flNextPainSoundTime = 0;
-	m_flNextAlertSoundTime = 0;
-	m_bShouldPatrol = false;
+	SetSolid( SOLID_BBOX );
+	AddSolidFlags( FSOLID_NOT_STANDABLE );
+	SetMoveType( MOVETYPE_STEP );
+	SetBloodColor( BLOOD_COLOR_RED );
+	m_nIdleChatterType = METROPOLICE_CHATTER_ASK_QUESTION; 
+	m_bSimpleCops = HasSpawnFlags( SF_METROPOLICE_SIMPLE_VERSION );
+	if ( HasSpawnFlags( SF_METROPOLICE_NOCHATTER ) )
+	{
+		AddSpawnFlags( SF_NPC_GAG );
+	}
 
-	//	CapabilitiesAdd( bits_CAP_TURN_HEAD | bits_CAP_MOVE_GROUND | bits_CAP_MOVE_JUMP | bits_CAP_MOVE_CLIMB);
-	// JAY: Disabled jump for now - hard to compare to HL1
-	CapabilitiesAdd(bits_CAP_TURN_HEAD | bits_CAP_MOVE_GROUND);
+	if (!m_bSimpleCops)
+	{
+		m_iHealth = sk_metropolice_health.GetFloat();
+	}
+	else
+	{
+		m_iHealth = sk_metropolice_simple_health.GetFloat();
+	}
 
-	CapabilitiesAdd(bits_CAP_AIM_GUN);
+	m_flFieldOfView		= -0.2;// indicates the width of this NPC's forward view cone ( as a dotproduct result )
+	m_NPCState			= NPC_STATE_NONE;
+	if ( !HasSpawnFlags( SF_NPC_START_EFFICIENT ) )
+	{
+		CapabilitiesAdd( bits_CAP_TURN_HEAD | bits_CAP_ANIMATEDFACE );
+		CapabilitiesAdd( bits_CAP_AIM_GUN | bits_CAP_MOVE_SHOOT );
+	}
+	CapabilitiesAdd( bits_CAP_MOVE_GROUND );
+	CapabilitiesAdd( bits_CAP_USE_WEAPONS | bits_CAP_NO_HIT_SQUADMATES );
+	CapabilitiesAdd( bits_CAP_SQUAD );
+	CapabilitiesAdd( bits_CAP_DUCK | bits_CAP_DOORS_GROUP );
+	CapabilitiesAdd( bits_CAP_USE_SHOT_REGULATOR );
 
-	// Innate range attack for grenade
-	// CapabilitiesAdd(bits_CAP_INNATE_RANGE_ATTACK2 );
+	m_nBurstHits = 0;
+	m_HackedGunPos = Vector ( 0, 0, 55 );
 
-	// Innate range attack for kicking
-	CapabilitiesAdd(bits_CAP_INNATE_MELEE_ATTACK1);
-
-	// Can be in a squad
-	CapabilitiesAdd(bits_CAP_SQUAD);
-	CapabilitiesAdd(bits_CAP_USE_WEAPONS);
-
-	CapabilitiesAdd(bits_CAP_DUCK);				// In reloading and cover
-
-	CapabilitiesAdd(bits_CAP_NO_HIT_SQUADMATES);
-
-	m_bFirstEncounter = true;// this is true when the grunt spawns, because he hasn't encountered an enemy yet.
-
-	m_HackedGunPos = Vector(0, 0, 55);
-
-	m_flStopMoveShootTime = FLT_MAX; // Move and shoot defaults on.
-	m_MoveAndShootOverlay.SetInitialDelay(0.75); // But with a bit of a delay.
-
-	m_flNextLostSoundTime = 0;
-	m_flAlertPatrolTime = 0;
-
-	m_flNextAltFireTime = gpGlobals->curtime;
+	m_iPistolClips = METROPOLICE_NUM_CLIPS;
 
 	NPCInit();
 
-#ifdef MAPBASE
-	// This was moved from CalcWeaponProficiency() so soldiers don't change skin unnaturally and uncontrollably
-	if (GetActiveWeapon() && EntIsClass(GetActiveWeapon(), gm_isz_class_Shotgun) && m_nSkin != COMBINE_SKIN_SHOTGUNNER)
+	// NOTE: This must occur *after* init, since init sets default dist look
+	if ( HasSpawnFlags( SF_METROPOLICE_MID_RANGE_ATTACK ) )
 	{
-		m_nSkin = COMBINE_SKIN_SHOTGUNNER;
+		m_flDistTooFar = METROPOLICE_MID_RANGE_ATTACK_RANGE;
+		SetDistLook( METROPOLICE_MID_RANGE_ATTACK_RANGE );
 	}
-#endif
-}
 
-//-----------------------------------------------------------------------------
-// Purpose: 
-// Output : Returns true on success, false on failure.
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::CreateBehaviors()
-{
-	AddBehavior(&m_RappelBehavior);
-	AddBehavior(&m_ActBusyBehavior);
-	AddBehavior(&m_AssaultBehavior);
-	AddBehavior(&m_StandoffBehavior);
-	AddBehavior(&m_FollowBehavior);
-	AddBehavior(&m_FuncTankBehavior);
-#ifdef MAPBASE
-	AddBehavior(&m_PolicingBehavior);
-#endif
+	m_hManhack = NULL;
 
-	return BaseClass::CreateBehaviors();
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::PostNPCInit()
-{
-#ifndef MAPBASE
-	if (IsElite())
+	if ( GetActiveWeapon() )
 	{
-		// Give a warning if a Combine Soldier is equipped with anything other than
-		// an AR2. 
-		if (!GetActiveWeapon() || !FClassnameIs(GetActiveWeapon(), "weapon_ar2"))
-		{
-			DevWarning("**Combine Elite Soldier MUST be equipped with AR2\n");
-		}
-	}
-#endif
+		CBaseCombatWeapon *pWeapon;
 
-	BaseClass::PostNPCInit();
-}
+		pWeapon = GetActiveWeapon();
 
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::GatherConditions()
-{
-	BaseClass::GatherConditions();
-
-	ClearCondition(COND_COMBINE_ATTACK_SLOT_AVAILABLE);
-
-	if (GetState() == NPC_STATE_COMBAT)
-	{
 #ifdef MAPBASE
-		// Don't override the standoff
-		if (IsCurSchedule(SCHED_COMBINE_WAIT_IN_COVER, false) && !m_StandoffBehavior.IsActive())
+		if (!EntIsClass(pWeapon, gm_isz_class_Pistol) && !EntIsClass(pWeapon, gm_isz_class_357))
 #else
-		if (IsCurSchedule(SCHED_COMBINE_WAIT_IN_COVER, false))
+		if( !FClassnameIs( pWeapon, "weapon_pistol" ) )
 #endif
 		{
-			// Soldiers that are standing around doing nothing poll for attack slots so
-			// that they can respond quickly when one comes available. If they can 
-			// occupy a vacant attack slot, they do so. This holds the slot until their
-			// schedule breaks and schedule selection runs again, essentially reserving this
-			// slot. If they do not select an attack schedule, then they'll release the slot.
-			if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-			{
-				SetCondition(COND_COMBINE_ATTACK_SLOT_AVAILABLE);
-			}
-		}
-
-		if (IsUsingTacticalVariant(TACTICAL_VARIANT_PRESSURE_ENEMY_UNTIL_CLOSE))
-		{
-			if (GetEnemy() != NULL && !HasCondition(COND_ENEMY_OCCLUDED))
-			{
-				// Now we're close to our enemy, stop using the tactical variant.
-				if (GetAbsOrigin().DistToSqr(GetEnemy()->GetAbsOrigin()) < Square(30.0f * 12.0f))
-					m_iTacticalVariant = TACTICAL_VARIANT_DEFAULT;
-			}
-		}
-	}
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-void CNPC_Combine::PrescheduleThink()
-{
-	BaseClass::PrescheduleThink();
-
-	// Speak any queued sentences
-#ifndef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	m_Sentences.UpdateSentenceQueue();
-#endif
-
-	if (IsOnFire())
-	{
-		SetCondition(COND_COMBINE_ON_FIRE);
-	}
-	else
-	{
-		ClearCondition(COND_COMBINE_ON_FIRE);
-	}
-
-	extern ConVar ai_debug_shoot_positions;
-	if (ai_debug_shoot_positions.GetBool())
-		NDebugOverlay::Cross3D(EyePosition(), 16, 0, 255, 0, false, 0.1);
-
-	if (gpGlobals->curtime >= m_flStopMoveShootTime)
-	{
-		// Time to stop move and shoot and start facing the way I'm running.
-		// This makes the combine look attentive when disengaging, but prevents
-		// them from always running around facing you.
-		//
-		// Only do this if it won't be immediately shut off again.
-		if (GetNavigator()->GetPathTimeToGoal() > 1.0f)
-		{
-			m_MoveAndShootOverlay.SuspendMoveAndShoot(5.0f);
-			m_flStopMoveShootTime = FLT_MAX;
-		}
-	}
-
-	if (m_flGroundSpeed > 0 && GetState() == NPC_STATE_COMBAT && m_MoveAndShootOverlay.IsSuspended())
-	{
-		// Return to move and shoot when near my goal so that I 'tuck into' the location facing my enemy.
-		if (GetNavigator()->GetPathTimeToGoal() <= 1.0f)
-		{
-			m_MoveAndShootOverlay.SuspendMoveAndShoot(0);
-		}
-	}
-}
-
-#ifndef MAPBASE
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::DelayAltFireAttack(float flDelay)
-{
-	float flNextAltFire = gpGlobals->curtime + flDelay;
-
-	if (flNextAltFire > m_flNextAltFireTime)
-	{
-		// Don't let this delay order preempt a previous request to wait longer.
-		m_flNextAltFireTime = flNextAltFire;
-	}
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::DelaySquadAltFireAttack(float flDelay)
-{
-	// Make sure to delay my own alt-fire attack.
-	DelayAltFireAttack(flDelay);
-
-	AISquadIter_t iter;
-	CAI_BaseNPC* pSquadmate = m_pSquad ? m_pSquad->GetFirstMember(&iter) : NULL;
-	while (pSquadmate)
-	{
-		CNPC_Combine* pCombine = dynamic_cast<CNPC_Combine*>(pSquadmate);
-
-#ifdef MAPBASE
-		if (pCombine && pCombine->IsAltFireCapable())
-#else
-		if (pCombine && pCombine->IsElite())
-#endif
-		{
-			pCombine->DelayAltFireAttack(flDelay);
-		}
-
-		pSquadmate = m_pSquad->GetNextMember(&iter);
-	}
-}
-#endif
-
-//-----------------------------------------------------------------------------
-// Purpose: degrees to turn in 0.1 seconds
-//-----------------------------------------------------------------------------
-float CNPC_Combine::MaxYawSpeed(void)
-{
-	// [MODIFICATION] This is a high-priority override for our "turbo turn" mechanic.
-	// It checks our custom flag before running the default logic.
-	// Without it: The Combine would be locked to its default, slower turning speeds,
-	// making the grenade-facing action too slow to be effective before the grenade explodes.
-	if (m_bForceFastTurn)
-	{
-		// If the flag is set by TASK_COMBINE_FACE_GRENADE, return a very high turning speed.
-		return 200.0f;
-	}
-
-	// If the turbo flag is not set, the original Valve logic runs,
-	// determining the turn speed based on the NPC's current activity.
-	switch (GetActivity())
-	{
-	case ACT_TURN_LEFT:
-	case ACT_TURN_RIGHT:
-		return 45;
-		break;
-	case ACT_RUN:
-	case ACT_RUN_HURT:
-		return 15;
-		break;
-	case ACT_WALK:
-	case ACT_WALK_CROUCH:
-		return 25;
-		break;
-	case ACT_RANGE_ATTACK1:
-	case ACT_RANGE_ATTACK2:
-	case ACT_MELEE_ATTACK1:
-	case ACT_MELEE_ATTACK2:
-		return 35;
-	default:
-		return 35;
-		break;
-	}
-}
-
-//-----------------------------------------------------------------------------
-// 
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::ShouldMoveAndShoot()
-{
-	// Set this timer so that gpGlobals->curtime can't catch up to it. 
-	// Essentially, we're saying that we're not going to interfere with 
-	// what the AI wants to do with move and shoot. 
-	//
-	// If any code below changes this timer, the code is saying 
-	// "It's OK to move and shoot until gpGlobals->curtime == m_flStopMoveShootTime"
-	m_flStopMoveShootTime = FLT_MAX;
-
-	if (IsCurSchedule(SCHED_COMBINE_HIDE_AND_RELOAD, false))
-		m_flStopMoveShootTime = gpGlobals->curtime + random->RandomFloat(0.4f, 0.6f);
-
-	if (IsCurSchedule(SCHED_TAKE_COVER_FROM_BEST_SOUND, false))
-		return false;
-
-	if (IsCurSchedule(SCHED_COMBINE_TAKE_COVER_FROM_BEST_SOUND, false))
-		return false;
-
-	if (IsCurSchedule(SCHED_COMBINE_RUN_AWAY_FROM_BEST_SOUND, false))
-		return false;
-
-	if (HasCondition(COND_NO_PRIMARY_AMMO, false))
-		m_flStopMoveShootTime = gpGlobals->curtime + random->RandomFloat(0.4f, 0.6f);
-
-	if (m_pSquad && IsCurSchedule(SCHED_COMBINE_TAKE_COVER1, false))
-		m_flStopMoveShootTime = gpGlobals->curtime + random->RandomFloat(0.4f, 0.6f);
-
-	return BaseClass::ShouldMoveAndShoot();
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: turn in the direction of movement
-// Output :
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::OverrideMoveFacing(const AILocalMoveGoal_t& move, float flInterval)
-{
-	return BaseClass::OverrideMoveFacing(move, flInterval);
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//
-//
-//-----------------------------------------------------------------------------
-Class_T	CNPC_Combine::Classify(void)
-{
-	return CLASS_COMBINE;
-}
-
-#ifdef MAPBASE
-//-----------------------------------------------------------------------------
-// Purpose: Function for gauging whether we're capable of alt-firing.
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::IsAltFireCapable(void)
-{
-	// The base class tells us if we're carrying an alt-fire-able weapon.
-	return (IsElite() || m_bAlternateCapable) && BaseClass::IsAltFireCapable();
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Function for gauging whether we're capable of throwing grenades.
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::IsGrenadeCapable(void)
-{
-	return !IsElite() || m_bAlternateCapable;
-}
-#endif
-
-
-//-----------------------------------------------------------------------------
-// Continuous movement tasks
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::IsCurTaskContinuousMove()
-{
-	const Task_t* pTask = GetTask();
-	if (pTask && (pTask->iTask == TASK_COMBINE_CHASE_ENEMY_CONTINUOUSLY))
-		return true;
-
-	return BaseClass::IsCurTaskContinuousMove();
-}
-
-
-//-----------------------------------------------------------------------------
-// Chase the enemy, updating the target position as the player moves
-//-----------------------------------------------------------------------------
-void CNPC_Combine::StartTaskChaseEnemyContinuously(const Task_t* pTask)
-{
-	CBaseEntity* pEnemy = GetEnemy();
-	if (!pEnemy)
-	{
-		TaskFail(FAIL_NO_ENEMY);
-		return;
-	}
-
-	// We're done once we get close enough
-	if (WorldSpaceCenter().DistToSqr(pEnemy->WorldSpaceCenter()) <= pTask->flTaskData * pTask->flTaskData)
-	{
-		TaskComplete();
-		return;
-	}
-
-	// TASK_GET_PATH_TO_ENEMY
-	if (IsUnreachable(pEnemy))
-	{
-		TaskFail(FAIL_NO_ROUTE);
-		return;
-	}
-
-	if (!GetNavigator()->SetGoal(GOALTYPE_ENEMY, AIN_NO_PATH_TASK_FAIL))
-	{
-		// no way to get there =( 
-		DevWarning(2, "GetPathToEnemy failed!!\n");
-		RememberUnreachable(pEnemy);
-		TaskFail(FAIL_NO_ROUTE);
-		return;
-	}
-
-	// NOTE: This is TaskRunPath here.
-	if (TranslateActivity(ACT_RUN) != ACT_INVALID)
-	{
-		GetNavigator()->SetMovementActivity(ACT_RUN);
-	}
-	else
-	{
-		GetNavigator()->SetMovementActivity(ACT_WALK);
-	}
-
-	// Cover is void once I move
-	Forget(bits_MEMORY_INCOVER);
-
-	if (GetNavigator()->GetGoalType() == GOALTYPE_NONE)
-	{
-		TaskComplete();
-		GetNavigator()->ClearGoal();		// Clear residual state
-		return;
-	}
-
-	// No shooting delay when in this mode
-	m_MoveAndShootOverlay.SetInitialDelay(0.0);
-
-	if (!GetNavigator()->IsGoalActive())
-	{
-		SetIdealActivity(GetStoppedActivity());
-	}
-	else
-	{
-		// Check validity of goal type
-		ValidateNavGoal();
-	}
-
-	// set that we're probably going to stop before the goal
-	GetNavigator()->SetArrivalDistance(pTask->flTaskData);
-	m_vSavePosition = GetEnemy()->WorldSpaceCenter();
-}
-
-void CNPC_Combine::RunTaskChaseEnemyContinuously(const Task_t* pTask)
-{
-	if (!GetNavigator()->IsGoalActive())
-	{
-		SetIdealActivity(GetStoppedActivity());
-	}
-	else
-	{
-		// Check validity of goal type
-		ValidateNavGoal();
-	}
-
-	CBaseEntity* pEnemy = GetEnemy();
-	if (!pEnemy)
-	{
-		TaskFail(FAIL_NO_ENEMY);
-		return;
-	}
-
-	// We're done once we get close enough
-	if (WorldSpaceCenter().DistToSqr(pEnemy->WorldSpaceCenter()) <= pTask->flTaskData * pTask->flTaskData)
-	{
-		GetNavigator()->StopMoving();
-		TaskComplete();
-		return;
-	}
-
-	// Recompute path if the enemy has moved too much
-	if (m_vSavePosition.DistToSqr(pEnemy->WorldSpaceCenter()) < (pTask->flTaskData * pTask->flTaskData))
-		return;
-
-	if (IsUnreachable(pEnemy))
-	{
-		TaskFail(FAIL_NO_ROUTE);
-		return;
-	}
-
-	if (!GetNavigator()->RefindPathToGoal())
-	{
-		TaskFail(FAIL_NO_ROUTE);
-		return;
-	}
-
-	m_vSavePosition = pEnemy->WorldSpaceCenter();
-}
-
-//=========================================================
-// start task
-//=========================================================
-void CNPC_Combine::StartTask(const Task_t* pTask)
-{
-	// NOTE: This reset is required because we change it in TASK_COMBINE_CHASE_ENEMY_CONTINUOUSLY
-	m_MoveAndShootOverlay.SetInitialDelay(0.75);
-
-	switch (pTask->iTask)
-	{
-		// [MODIFICATION] This case begins the "Catch and Return" sequence.
-		// Its job is to set the state flag and acquire the grenade target.
-		// Without it: The pull-and-throw ability would not have a target to pull, and the grenade-blocking logic in HandleAnimEvent would not activate.
-	case TASK_COMBINE_PULL_GRENADE:
-	{
-		// Set the state flag to true, preventing the AI from throwing a duplicate grenade via AnimEvent.
-		m_bIsReturningGrenade = true;
-		DevMsg("StartTask: INICIANDO TASK DE PUXAR (PULL_GRENADE).\n");
-
-		// Find the grenade entity by getting the source of the last danger sound.
-		CSound* pSound = GetBestSound();
-		if (pSound && pSound->m_hOwner && strcmp(pSound->m_hOwner->GetClassname(), "npc_grenade_frag") == 0)
-		{
-		// If found, store a handle to it for the RunTask to use.
-			m_hPulledObject = pSound->m_hOwner;
-			DevMsg("StartTask: Alvo travado: %s\n", m_hPulledObject->GetClassname());
-		}
-		else
-		{
-			// If no valid grenade is found, fail the task and abort the schedule.
-			DevMsg("StartTask: Falha ao iniciar PULL_GRENADE. Alvo inválido ou som expirou.\n");
-			TaskFail(FAIL_NO_ENEMY);
-		}
-		break;
-	}
-
-	// [MODIFICATION] This case executes the "throw back" part of the "Catch and Return" ability.
-	// It detaches the grenade, applies a launch velocity, and resets state variables.
-	// Without it: The caught grenade would remain stuck to the Combine's hand indefinitely.
-	case TASK_COMBINE_LAUNCH_GRENADE:
-	{
-		// First, reset the state flag to allow normal grenade throws again.
-		m_bIsReturningGrenade = false;
-
-		if (m_hPulledObject.Get())
-		{
-			IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();
-			if (pPhysObject)
-			{
-				// Detach the grenade from the hand and re-enable its physics simulation.
-				m_hPulledObject->SetParent(NULL);
-				pPhysObject->EnableMotion(true);
-				pPhysObject->Wake();
-
-				// This logic launches the grenade towards the current enemy.
-				CBaseEntity* pEnemy = GetEnemy();
-				if (pEnemy)
-				{
-					Vector vecLaunchDir = pEnemy->WorldSpaceCenter() - m_hPulledObject->WorldSpaceCenter();
-					VectorNormalize(vecLaunchDir);
-
-					Vector vecForward, vecUp;
-					GetVectors(&vecForward, NULL, &vecUp);
-					Vector vecVelocity = (vecLaunchDir * 750.0f) + (vecUp * 175.0f);
-					pPhysObject->SetVelocity(&vecVelocity, NULL);
-				}
-
-				// Activate the ability's cooldown.
-				m_flNextGrenadeCatchTime = gpGlobals->curtime + 2.5f;
-			}
-			// Clean up the handle.
-			m_hPulledObject = NULL;
-		}
-
-		TaskComplete();
-		break;
-	}
-
-	// [MODIFICATION] This case initiates the "turbo turn" behavior.
-	// Its only job is to set a flag that is checked by the MaxYawSpeed() override.
-	// Without it: The facing task would be very slow, likely causing the grenade to explode before the ability completes.}
-	case TASK_COMBINE_FACE_GRENADE:
-	{
-		// Ao iniciar a task, LIGA o modo turbo.
-		m_bForceFastTurn = true;
-		DevMsg("StartTask: Iniciando task para VIRAR para a granada (TURBO LIGADO).\n");
-		break; 
-	}
-
-	// [MODIFICATION] This task "memorizes" the grenade for the kick schedule.
-	// It finds the grenade and stores it in our private handle.
-	// Without it: The kick logic in HandleAnimEvent would not know which object to apply force to.
-	case TASK_COMBINE_MEMORIZE_GRENADE:
-	{
-		CSound* pSound = GetBestSound();
-		if (pSound && pSound->m_hOwner)
-		{
-			m_hPulledObject = pSound->m_hOwner;
-			TaskComplete();
-		}
-		else
-		{
-			TaskFail(FAIL_NO_TARGET);
-		}
-		break;
-	}
-
-	// [MODIFICATION] This task applies the kick physics to the memorized grenade.
-	// It is used in the "Kick Grenade" schedule as an alternative to using an AnimEvent.
-	// Without it: The kick animation would play, but no force would be applied to the grenade.
-	case TASK_COMBINE_KICK_LAUNCH:
-{
-	// When this task runs, the ability is over, so reset the state flag.
-	m_bIsReturningGrenade = false;
-
-	// Check if the NPC is actually holding an object to kick.
-	if (m_hPulledObject.Get())
-	{
-		// Get the physics object associated with the held entity.
-		IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();
-
-		// Ensure we have a valid physics object to manipulate.
-		if (pPhysObject)
-		{
-			// Declare vectors to store the NPC's forward and upward orientation.
-			Vector vecForward, vecUp;
-			// Get the NPC's current forward and up direction vectors.
-			GetVectors(&vecForward, NULL, &vecUp);
-
-			// Calculate the kick velocity: a strong forward force (800 units) with a slight upward lift (200 units).
-			Vector vecKickVelocity = (vecForward * 800.0f) + (vecUp * 200.0f);
-			// Apply the calculated velocity to the physics object, launching it.
-			pPhysObject->SetVelocity(&vecKickVelocity, NULL);
-
-			// Play the weapon bash/kick sound effect.
-			EmitSound("NPC_Combine.WeaponBash");
-
-			// Set a cooldown of 2.5 seconds before this ability can be used again.
-			m_flNextGrenadeCatchTime = gpGlobals->curtime + 2.5f;
-			// Clear the handle to the pulled object, as the NPC is no longer holding it.
-			m_hPulledObject = NULL;
-		}
-	}
-	// Signal to the AI scheduler that this task has been successfully completed.
-	TaskComplete();
-	// Exit the switch statement.
-	break;
-}
-
-
-
-	case TASK_COMBINE_SET_STANDING:
-	{
-		if (pTask->flTaskData == 1.0f)
-		{
-			// <<< DEBUG PARA LEVANTAR >>>
-			DevMsg("Combine Task: ORDEM PARA LEVANTAR RECEBIDA (Valor: 1)\n");
-			Stand();
-		}
-		else
-		{
-			// <<< DEBUG PARA AGACHAR >>>
-			DevMsg("Combine Task: ORDEM PARA AGACHAR RECEBIDA (Valor: 0)\n");
-			Crouch();
-		}
-		TaskComplete();
-	}
-	break;
-
-	case TASK_COMBINE_CHASE_ENEMY_CONTINUOUSLY:
-		StartTaskChaseEnemyContinuously(pTask);
-		break;
-
-	case TASK_COMBINE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET:
-		SetIdealActivity((Activity)(int)pTask->flTaskData);
-		GetMotor()->SetIdealYawToTargetAndUpdate(m_vecAltFireTarget, AI_KEEP_YAW_SPEED);
-		break;
-
-	case TASK_COMBINE_SIGNAL_BEST_SOUND:
-		if (IsInSquad() && GetSquad()->NumMembers() > 1)
-		{
-			CBasePlayer* pPlayer = AI_GetSinglePlayer();
-
-			if (pPlayer && OccupyStrategySlot(SQUAD_SLOT_EXCLUSIVE_HANDSIGN) && pPlayer->FInViewCone(this))
-			{
-				CSound* pSound;
-				pSound = GetBestSound();
-
-				Assert(pSound != NULL);
-
-				if (pSound)
-				{
-					Vector right, tosound;
-
-					GetVectors(NULL, &right, NULL);
-
-					tosound = pSound->GetSoundReactOrigin() - GetAbsOrigin();
-					VectorNormalize(tosound);
-
-					tosound.z = 0;
-					right.z = 0;
-
-					if (DotProduct(right, tosound) > 0)
-					{
-						// Right
-						SetIdealActivity(ACT_SIGNAL_RIGHT);
-					}
-					else
-					{
-						// Left
-						SetIdealActivity(ACT_SIGNAL_LEFT);
-					}
-
-					break;
-				}
-			}
-		}
-
-		// Otherwise, just skip it.
-		TaskComplete();
-		break;
-
-	case TASK_ANNOUNCE_ATTACK:
-	{
-		// If Primary Attack
-		if ((int)pTask->flTaskData == 1)
-		{
-			// -----------------------------------------------------------
-			// If enemy isn't facing me and I haven't attacked in a while
-			// annouce my attack before I start wailing away
-			// -----------------------------------------------------------
-			CBaseCombatCharacter* pBCC = GetEnemyCombatCharacterPointer();
-
-			if (pBCC && pBCC->IsPlayer() && (!pBCC->FInViewCone(this)) &&
-				(gpGlobals->curtime - m_flLastAttackTime > 3.0))
-			{
-				m_flLastAttackTime = gpGlobals->curtime;
-
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-				SpeakIfAllowed(TLK_CMB_ANNOUNCE, SENTENCE_PRIORITY_HIGH);
-#else
-				m_Sentences.Speak("COMBINE_ANNOUNCE", SENTENCE_PRIORITY_HIGH);
-#endif
-
-				// Wait two seconds
-				SetWait(2.0);
-
-				if (!IsCrouching())
-				{
-					SetActivity(ACT_IDLE);
-				}
-				else
-				{
-					SetActivity(ACT_COWER); // This is really crouch idle
-				}
-			}
-			// -------------------------------------------------------------
-			//  Otherwise move on
-			// -------------------------------------------------------------
-			else
-			{
-				TaskComplete();
-			}
-		}
-		else
-		{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			SpeakIfAllowed(TLK_CMB_THROWGRENADE, SENTENCE_PRIORITY_MEDIUM);
-#else
-			m_Sentences.Speak("COMBINE_THROW_GRENADE", SENTENCE_PRIORITY_MEDIUM);
-#endif
-			SetActivity(ACT_IDLE);
-
-			// Wait two seconds
-			SetWait(2.0);
-		}
-		break;
-	}
-
-	case TASK_WALK_PATH:
-	case TASK_RUN_PATH:
-		// grunt no longer assumes he is covered if he moves
-		Forget(bits_MEMORY_INCOVER);
-		BaseClass::StartTask(pTask);
-		break;
-
-	case TASK_COMBINE_FACE_TOSS_DIR:
-		break;
-
-	case TASK_COMBINE_GET_PATH_TO_FORCED_GREN_LOS:
-#ifdef MAPBASE
-		StartTask_GetPathToForced(pTask);
-#else
-		{
-			if (!m_hForcedGrenadeTarget)
-			{
-				TaskFail(FAIL_NO_ENEMY);
-				return;
-			}
-
-			float flMaxRange = 2000;
-			float flMinRange = 0;
-
-			Vector vecEnemy = m_hForcedGrenadeTarget->GetAbsOrigin();
-			Vector vecEnemyEye = vecEnemy + m_hForcedGrenadeTarget->GetViewOffset();
-
-			Vector posLos;
-			bool found = false;
-
-			if (GetTacticalServices()->FindLateralLos(vecEnemyEye, &posLos))
-			{
-				float dist = (posLos - vecEnemyEye).Length();
-				if (dist < flMaxRange && dist > flMinRange)
-					found = true;
-			}
-
-			if (!found && GetTacticalServices()->FindLos(vecEnemy, vecEnemyEye, flMinRange, flMaxRange, 1.0, &posLos))
-			{
-				found = true;
-			}
-
-			if (!found)
-			{
-				TaskFail(FAIL_NO_SHOOT);
-			}
-			else
-			{
-				// else drop into run task to offer an interrupt
-				m_vInterruptSavePosition = posLos;
-			}
-		}
-#endif
-		break;
-
-	case TASK_COMBINE_IGNORE_ATTACKS:
-		// must be in a squad
-		if (m_pSquad && m_pSquad->NumMembers() > 2)
-		{
-			// the enemy must be far enough away
-			if (GetEnemy() && (GetEnemy()->WorldSpaceCenter() - WorldSpaceCenter()).Length() > 512.0)
-			{
-				m_flNextAttack = gpGlobals->curtime + pTask->flTaskData;
-			}
-		}
-		TaskComplete();
-		break;
-
-	case TASK_COMBINE_DEFER_SQUAD_GRENADES:
-	{
-#ifdef MAPBASE
-		StartTask_DeferSquad(pTask);
-#else
-		if (m_pSquad)
-		{
-			// iterate my squad and stop everyone from throwing grenades for a little while.
-			AISquadIter_t iter;
-
-			CAI_BaseNPC* pSquadmate = m_pSquad ? m_pSquad->GetFirstMember(&iter) : NULL;
-			while (pSquadmate)
-			{
-#ifdef MAPBASE
-				pSquadmate->DelayGrenadeCheck(5);
-#else
-				CNPC_Combine* pCombine = dynamic_cast<CNPC_Combine*>(pSquadmate);
-
-				if (pCombine)
-				{
-					pCombine->m_flNextGrenadeCheck = gpGlobals->curtime + 5;
-				}
-#endif
-
-				pSquadmate = m_pSquad->GetNextMember(&iter);
-			}
-		}
-
-		TaskComplete();
-#endif
-		break;
-	}
-
-	case TASK_FACE_IDEAL:
-	case TASK_FACE_ENEMY:
-	{
-		if (pTask->iTask == TASK_FACE_ENEMY && HasCondition(COND_CAN_RANGE_ATTACK1))
-		{
-			TaskComplete();
-			return;
-		}
-
-		BaseClass::StartTask(pTask);
-		bool bIsFlying = (GetMoveType() == MOVETYPE_FLY) || (GetMoveType() == MOVETYPE_FLYGRAVITY);
-		if (bIsFlying)
-		{
-			SetIdealActivity(ACT_GLIDE);
-		}
-
-	}
-	break;
-
-	case TASK_FIND_COVER_FROM_ENEMY:
-	{
-		if (GetHintGroup() == NULL_STRING)
-		{
-			CBaseEntity* pEntity = GetEnemy();
-
-			// FIXME: this should be generalized by the schedules that are selected, or in the definition of 
-			// what "cover" means (i.e., trace attack vulnerability vs. physical attack vulnerability
-			if (pEntity)
-			{
-				// NOTE: This is a good time to check to see if the player is hurt.
-				// Have the combine notice this and call out
-				if (!HasMemory(bits_MEMORY_PLAYER_HURT) && pEntity->IsPlayer() && pEntity->GetHealth() <= 20)
-				{
-					if (m_pSquad)
-					{
-						m_pSquad->SquadRemember(bits_MEMORY_PLAYER_HURT);
-					}
-
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-					SpeakIfAllowed(TLK_CMB_PLAYERHIT, SENTENCE_PRIORITY_INVALID);
-#else
-					m_Sentences.Speak("COMBINE_PLAYERHIT", SENTENCE_PRIORITY_INVALID);
-#endif
-					JustMadeSound(SENTENCE_PRIORITY_HIGH);
-				}
-				if (pEntity->MyNPCPointer())
-				{
-					if (!(pEntity->MyNPCPointer()->CapabilitiesGet() & bits_CAP_WEAPON_RANGE_ATTACK1) &&
-						!(pEntity->MyNPCPointer()->CapabilitiesGet() & bits_CAP_INNATE_RANGE_ATTACK1))
-					{
-						TaskComplete();
-						return;
-					}
-				}
-			}
-		}
-		BaseClass::StartTask(pTask);
-	}
-	break;
-	case TASK_RANGE_ATTACK1:
-	{
-#ifdef MAPBASE
-		// The game can crash if a soldier's weapon is removed while they're shooting
-		if (!GetActiveWeapon())
-		{
-			TaskFail("No weapon");
-			break;
-		}
-#endif
-
-		m_nShots = GetActiveWeapon()->GetRandomBurst();
-		m_flShotDelay = GetActiveWeapon()->GetFireRate();
-
-		m_flNextAttack = gpGlobals->curtime + m_flShotDelay - 0.1;
-		ResetIdealActivity(ACT_RANGE_ATTACK1);
-		m_flLastAttackTime = gpGlobals->curtime;
-	}
-	break;
-
-	case TASK_COMBINE_DIE_INSTANTLY:
-	{
-		CTakeDamageInfo info;
-
-		info.SetAttacker(this);
-		info.SetInflictor(this);
-		info.SetDamage(m_iHealth);
-		info.SetDamageType(pTask->flTaskData);
-		info.SetDamageForce(Vector(0.1, 0.1, 0.1));
-
-		TakeDamage(info);
-
-		TaskComplete();
-	}
-	break;
-
-	default:
-		BaseClass::StartTask(pTask);
-		break;
-	}
-}
-
-
-
-//=========================================================
-// RunTask
-//=========================================================
-void CNPC_Combine::RunTask(const Task_t* pTask)
-{
-	switch (pTask->iTask)
-	{
-	// [MODIFICATION] This task runs every frame to handle the grenade pull physics for the "Catch and Return" ability.
-	case TASK_COMBINE_PULL_GRENADE:
-	{
-		// --- Guard Clauses & Pre-computation ---
-		
-		// First, ensure the object we're pulling is still valid (e.g., hasn't exploded). If not, abort the schedule.
-		if (!m_hPulledObject.Get())
-		{
-			DevMsg("RunTask: Pulled object has disappeared! Failing task.\n");
-			TaskFail(FAIL_NO_ENEMY);
-			return;
-		}
-
-		// Ensure the object still has a physics representation.
-		IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();
-		if (!pPhysObject)
-		{
-			DevMsg("RunTask: Target does not have a valid physics object! Failing task.\n");
-			TaskFail(FAIL_NO_ENEMY);
-			return;
-		}
-
-		// Get the current position of the left hand attachment point, which is our pull target.
-		Vector vecHandPos;
-		QAngle angHand;
-		if (!GetAttachment("lefthand", vecHandPos, angHand))
-		{
-			DevMsg("RunTask: Fatal Error! 'lefthand' attachment not found on model.\n");
-			TaskFail(FAIL_NO_ENEMY);
-			return;
+			m_fWeaponDrawn = true;
 		}
 		
-		// Calculate the straight-line distance from the hand to the grenade.
-		Vector vecObjectPos = m_hPulledObject->WorldSpaceCenter();
-		float flDist = vecHandPos.DistTo(vecObjectPos);
-		DevMsg("RunTask: Pulling object. Distance: %.2f\n", flDist);
-
-		// --- Catch Logic ---
-		// If the grenade is close enough, "catch" it.
-		const float flCatchDistance = 24.0f;
-		if (flDist <= flCatchDistance)
+		if( !m_fWeaponDrawn ) 
 		{
-			DevMsg("RunTask: Objeto PEGO! Resetando timer e anexando à mão.\n");
+			GetActiveWeapon()->AddEffects( EF_NODRAW );
+		}
+	}
 
-			// Reset the grenade's fuse to give us time to throw it back.
-			CBaseGrenade* pBaseGrenade = static_cast<CBaseGrenade*>(m_hPulledObject.Get());
-			if (pBaseGrenade)
-			{
-				float flNewDetTime = 2.5f;
-				pBaseGrenade->m_flDetonateTime = gpGlobals->curtime + flNewDetTime;
-				pBaseGrenade->StopSound("Grenade.Tick");
-				DevMsg("RunTask: Timer da granada resetado!\n");
-			}
-			else
-			{
-				DevMsg("RunTask: Falha ao converter para CBaseGrenade.\n");
-			}
 
-			// Disable the grenade's physics simulation and attach it to the Combine's hand.
-			pPhysObject->EnableMotion(false);
-			int iHandAttachment = LookupAttachment("lefthand");
-			m_hPulledObject->SetParent(this, iHandAttachment);
+	m_TimeYieldShootSlot.Set( 2, 6 );
 
-			TaskComplete();
+	GetEnemies()->SetFreeKnowledgeDuration( 6.0 );
+
+	m_bShouldActivateBaton = false;
+	m_flValidStitchTime = -1.0f;
+	m_flNextLedgeCheckTime = -1.0f;
+	m_nBurstReloadCount = METROPOLICE_BURST_RELOAD_COUNT;
+	SetBurstMode( false );
+
+	// Clear out spawnflag if we're missing the smg1
+	if( HasSpawnFlags( SF_METROPOLICE_ALWAYS_STITCH ) )
+	{
+#ifdef MAPBASE
+		if ( !Weapon_OwnsThisType( STRING(gm_isz_class_SMG1) ) )
+#else
+		if ( !Weapon_OwnsThisType( "weapon_smg1" ) )
+#endif
+		{
+			Warning( "Warning! Metrocop is trying to use the stitch behavior but he has no smg1!\n" );
+			RemoveSpawnFlags( SF_METROPOLICE_ALWAYS_STITCH );
+		}
+	}
+
+	m_nNumWarnings = 0;
+	m_bPlayerTooClose = false;
+	m_bKeepFacingPlayer = false;
+	m_flChasePlayerTime = 0;
+	m_vecPreChaseOrigin = vec3_origin;
+	m_flPreChaseYaw = 0;
+
+	SetUse( &CNPC_MetroPolice::PrecriminalUse );
+
+	// Start us with a visible manhack if we have one
+	if ( m_iManhacks )
+	{
+		SetBodygroup( METROPOLICE_BODYGROUP_MANHACK, true );
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Update weapon ranges
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::Weapon_Equip( CBaseCombatWeapon *pWeapon )
+{
+	BaseClass::Weapon_Equip( pWeapon );
+
+	if ( HasSpawnFlags(SF_METROPOLICE_MID_RANGE_ATTACK) && GetActiveWeapon() )
+	{
+		GetActiveWeapon()->m_fMaxRange1 = METROPOLICE_MID_RANGE_ATTACK_RANGE;
+		GetActiveWeapon()->m_fMaxRange2 = METROPOLICE_MID_RANGE_ATTACK_RANGE;
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// FuncTankBehavior-related sentences
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SpeakFuncTankSentence( int nSentenceType )
+{
+	switch ( nSentenceType )
+	{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	case FUNCTANK_SENTENCE_MOVE_TO_MOUNT:
+		SpeakIfAllowed( TLK_COP_FT_APPROACH, SENTENCE_PRIORITY_MEDIUM );
+		break;
+
+	case FUNCTANK_SENTENCE_JUST_MOUNTED:
+		SpeakIfAllowed( TLK_COP_FT_MOUNT, SENTENCE_PRIORITY_HIGH );
+		break;
+
+	case FUNCTANK_SENTENCE_SCAN_FOR_ENEMIES:
+		SpeakIfAllowed( TLK_COP_FT_SCAN, SENTENCE_PRIORITY_NORMAL );
+		break;
+
+	case FUNCTANK_SENTENCE_DISMOUNTING:
+		SpeakIfAllowed( TLK_COP_FT_DISMOUNT, SENTENCE_PRIORITY_HIGH );
+		break;
+#else
+	case FUNCTANK_SENTENCE_MOVE_TO_MOUNT:
+		m_Sentences.Speak( "METROPOLICE_FT_APPROACH", SENTENCE_PRIORITY_MEDIUM );
+		break;
+
+	case FUNCTANK_SENTENCE_JUST_MOUNTED:
+		m_Sentences.Speak( "METROPOLICE_FT_MOUNT", SENTENCE_PRIORITY_HIGH );
+		break;
+
+	case FUNCTANK_SENTENCE_SCAN_FOR_ENEMIES:
+		m_Sentences.Speak( "METROPOLICE_FT_SCAN", SENTENCE_PRIORITY_NORMAL );
+		break;
+
+	case FUNCTANK_SENTENCE_DISMOUNTING:
+		m_Sentences.Speak( "METROPOLICE_FT_DISMOUNT", SENTENCE_PRIORITY_HIGH );
+		break;
+#endif
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Standoff Behavior-related sentences
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SpeakStandoffSentence( int nSentenceType )
+{
+	switch ( nSentenceType )
+	{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	case STANDOFF_SENTENCE_BEGIN_STANDOFF:
+		SpeakIfAllowed( TLK_COP_SO_BEGIN, SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_SQUAD_LEADER );
+		break;
+
+	case STANDOFF_SENTENCE_END_STANDOFF:
+		SpeakIfAllowed( TLK_COP_SO_END, SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_SQUAD_LEADER );
+		break;
+
+	case STANDOFF_SENTENCE_OUT_OF_AMMO:
+		AnnounceOutOfAmmo( );
+		break;
+
+	case STANDOFF_SENTENCE_FORCED_TAKE_COVER:
+		SpeakIfAllowed( TLK_COP_SO_FORCE_COVER );
+		break;
+
+	case STANDOFF_SENTENCE_STAND_CHECK_TARGET:
+		if ( gm_flTimeLastSpokePeek != 0 && gpGlobals->curtime - gm_flTimeLastSpokePeek > 20 )
+		{
+			SpeakIfAllowed( TLK_COP_SO_PEEK );
+			gm_flTimeLastSpokePeek = gpGlobals->curtime;
+		}
+		break;
+#else
+	case STANDOFF_SENTENCE_BEGIN_STANDOFF:
+		m_Sentences.Speak( "METROPOLICE_SO_BEGIN", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_SQUAD_LEADER );
+		break;
+
+	case STANDOFF_SENTENCE_END_STANDOFF:
+		m_Sentences.Speak( "METROPOLICE_SO_END", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_SQUAD_LEADER );
+		break;
+
+	case STANDOFF_SENTENCE_OUT_OF_AMMO:
+		AnnounceOutOfAmmo( );
+		break;
+
+	case STANDOFF_SENTENCE_FORCED_TAKE_COVER:
+		m_Sentences.Speak( "METROPOLICE_SO_FORCE_COVER" );
+		break;
+
+	case STANDOFF_SENTENCE_STAND_CHECK_TARGET:
+		if ( gm_flTimeLastSpokePeek != 0 && gpGlobals->curtime - gm_flTimeLastSpokePeek > 20 )
+		{
+			m_Sentences.Speak( "METROPOLICE_SO_PEEK" );
+			gm_flTimeLastSpokePeek = gpGlobals->curtime;
+		}
+		break;
+#endif
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Assault Behavior-related sentences
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SpeakAssaultSentence( int nSentenceType )
+{
+	switch ( nSentenceType )
+	{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	case ASSAULT_SENTENCE_HIT_RALLY_POINT:
+		SpeakIfAllowed( TLK_COP_AS_HIT_RALLY, SENTENCE_PRIORITY_NORMAL );
+		break;
+
+	case ASSAULT_SENTENCE_HIT_ASSAULT_POINT:
+		SpeakIfAllowed( TLK_COP_AS_HIT_ASSAULT, SENTENCE_PRIORITY_NORMAL );
+		break;
+
+	case ASSAULT_SENTENCE_SQUAD_ADVANCE_TO_RALLY:
+		if ( SpeakIfAllowed( TLK_COP_AS_ADV_RALLY, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_SQUAD_LEADER ) )
+		{
+			GetSquad()->BroadcastInteraction( g_interactionMetrocopClearSentenceQueues, NULL );
+		}
+		break;
+
+	case ASSAULT_SENTENCE_SQUAD_ADVANCE_TO_ASSAULT:
+		if ( SpeakIfAllowed( TLK_COP_AS_ADV_ASSAULT, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_SQUAD_LEADER ) )
+		{
+			GetSquad()->BroadcastInteraction( g_interactionMetrocopClearSentenceQueues, NULL );
+		}
+		break;
+
+	case ASSAULT_SENTENCE_COVER_NO_AMMO:
+		AnnounceOutOfAmmo( );
+		break;
+
+	case ASSAULT_SENTENCE_UNDER_ATTACK:
+		SpeakIfAllowed( TLK_COP_GO_ALERT );
+		break;
+#else
+	case ASSAULT_SENTENCE_HIT_RALLY_POINT:
+		m_Sentences.SpeakQueued( "METROPOLICE_AS_HIT_RALLY", SENTENCE_PRIORITY_NORMAL );
+		break;
+
+	case ASSAULT_SENTENCE_HIT_ASSAULT_POINT:
+		m_Sentences.SpeakQueued( "METROPOLICE_AS_HIT_ASSAULT", SENTENCE_PRIORITY_NORMAL );
+		break;
+
+	case ASSAULT_SENTENCE_SQUAD_ADVANCE_TO_RALLY:
+		if ( m_Sentences.Speak( "METROPOLICE_AS_ADV_RALLY", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_SQUAD_LEADER ) >= 0 )
+		{
+			GetSquad()->BroadcastInteraction( g_interactionMetrocopClearSentenceQueues, NULL );
+		}
+		break;
+
+	case ASSAULT_SENTENCE_SQUAD_ADVANCE_TO_ASSAULT:
+		if ( m_Sentences.Speak( "METROPOLICE_AS_ADV_ASSAULT", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_SQUAD_LEADER ) >= 0 )
+		{
+			GetSquad()->BroadcastInteraction( g_interactionMetrocopClearSentenceQueues, NULL );
+		}
+		break;
+
+	case ASSAULT_SENTENCE_COVER_NO_AMMO:
+		AnnounceOutOfAmmo( );
+		break;
+
+	case ASSAULT_SENTENCE_UNDER_ATTACK:
+		m_Sentences.Speak( "METROPOLICE_GO_ALERT" );
+		break;
+#endif
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Speaking while using TASK_SPEAK_SENTENCE
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SpeakSentence( int nSentenceType )
+{
+	if ( !PlayerIsCriminal() )
+		return;
+
+	if ( nSentenceType >= SENTENCE_BASE_BEHAVIOR_INDEX )
+	{
+		if ( GetRunningBehavior() == &m_FuncTankBehavior )
+		{
+			SpeakFuncTankSentence( nSentenceType );
 			return;
 		}
 
-		// --- Pulling Physics Logic (with Braking Zone) ---
-		// If not caught yet, apply a pull force.
-		float flPullForce;
-		const float flBrakingZone = 80.0f; 
-		if (flDist < flBrakingZone)
+#ifdef MAPBASE
+		// Fixed issues with standoff sentences not playing when they should
+		if ( m_StandoffBehavior.IsActive() )
+#else
+		if ( GetRunningBehavior() == &m_StandoffBehavior )
+#endif
 		{
-			// If inside the braking zone, use a weaker force for a smooth catch.
-			flPullForce = 500.0f;
-		}
-		else
-		{
-			// If outside the zone, use full force to pull it in quickly.
-			flPullForce = 1500.0f;
-		}
-
-		Vector vecPullDir = vecHandPos - vecObjectPos;
-		VectorNormalize(vecPullDir);
-		vecPullDir *= flPullForce;
-		pPhysObject->ApplyForceCenter(vecPullDir);
-		break;
-	}
-
-	// [MODIFICATION] This task is instantaneous. All logic is handled in StartTask.
-	case TASK_COMBINE_LAUNCH_GRENADE:
-	{
-		// This block is empty because the action is completed in a single frame in StartTask.
-		break;
-	}
-
-	// [MODIFICATION] This task actively turns the Combine to face the grenade.
-	case TASK_COMBINE_FACE_GRENADE:
-	{
-		// Every frame, re-acquire the grenade's position and update the motor's target yaw.
-		// This creates an "active" turn that prevents the AI from idling and restarting the schedule.
-		CSound* pSound = GetBestSound();
-		if (pSound && pSound->m_hOwner)
-		{
-			GetMotor()->SetIdealYawToTargetAndUpdate(pSound->m_hOwner->GetAbsOrigin());
-		}
-		else
-		{
-			// If the sound is lost, turn off the turbo and fail the task.
-			m_bForceFastTurn = false;
-			TaskFail(FAIL_NO_ENEMY);
+			SpeakStandoffSentence( nSentenceType );
 			return;
 		}
 
-		// The task completes only when the Combine is facing the ideal direction.
-		if (FacingIdeal())
+		if ( GetRunningBehavior() == &m_AssaultBehavior )
 		{
-			// On completion, we MUST disable the "turbo turn" flag to return to normal speed.
-			m_bForceFastTurn = false;
-			DevMsg("RunTask: Terminou de VIRAR para a granada (TURBO DESLIGADO).\n");
-			TaskComplete();
-		}
-		break;
-	}
-
-	case TASK_ANNOUNCE_ATTACK:
-	{
-		CBaseCombatCharacter* pBCC = GetEnemyCombatCharacterPointer();
-		if (!pBCC || pBCC->FInViewCone(this))
-		{
-			TaskComplete();
-		}
-
-		if (IsWaitFinished())
-		{
-			TaskComplete();
-		}
-	}
-	break;
-
-#ifdef MAPBASE
-	case TASK_COMBINE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET:
-		RunTask_FaceAltFireTarget(pTask);
-		break;
-
-	case TASK_COMBINE_FACE_TOSS_DIR:
-		RunTask_FaceTossDir(pTask);
-		break;
-
-	case TASK_COMBINE_GET_PATH_TO_FORCED_GREN_LOS:
-		RunTask_GetPathToForced(pTask);
-		break;
-#else
-	case TASK_COMBINE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET:
-		GetMotor()->SetIdealYawToTargetAndUpdate(m_vecAltFireTarget, AI_KEEP_YAW_SPEED);
-		if (IsActivityFinished())
-		{
-			TaskComplete();
-		}
-		break;
-
-	case TASK_COMBINE_FACE_TOSS_DIR:
-	{
-		GetMotor()->SetIdealYawToTargetAndUpdate(GetLocalOrigin() + m_vecTossVelocity * 64, AI_KEEP_YAW_SPEED);
-		if (FacingIdeal())
-		{
-			TaskComplete(true);
-		}
-		break;
-	}
-
-	case TASK_COMBINE_GET_PATH_TO_FORCED_GREN_LOS:
-	{
-		if (!m_hForcedGrenadeTarget)
-		{
-			TaskFail(FAIL_NO_ENEMY);
+			SpeakAssaultSentence( nSentenceType );
 			return;
 		}
-		if (GetTaskInterrupt() > 0)
-		{
-			ClearTaskInterrupt();
-			Vector vecEnemy = m_hForcedGrenadeTarget->GetAbsOrigin();
-			AI_NavGoal_t goal(m_vInterruptSavePosition, ACT_RUN, AIN_HULL_TOLERANCE);
-			GetNavigator()->SetGoal(goal, AIN_CLEAR_TARGET);
-			GetNavigator()->SetArrivalDirection(vecEnemy - goal.dest);
-		}
-		else
-		{
-			TaskInterrupt();
-		}
 	}
-	break;
-#endif
 
-
-
-	case TASK_RANGE_ATTACK1:
+	switch ( nSentenceType )
 	{
-		AutoMovement();
-		Vector vecEnemyLKP = GetEnemyLKP();
-		if (!FInAimCone(vecEnemyLKP))
-		{
-			GetMotor()->SetIdealYawToTargetAndUpdate(vecEnemyLKP, AI_KEEP_YAW_SPEED);
-		}
-		else
-		{
-			GetMotor()->SetIdealYawAndUpdate(GetMotor()->GetIdealYaw(), AI_KEEP_YAW_SPEED);
-		}
-		if (gpGlobals->curtime >= m_flNextAttack)
-		{
-			if (IsActivityFinished())
-			{
-				if (--m_nShots > 0)
-				{
-					ResetIdealActivity(ACT_RANGE_ATTACK1);
-					m_flLastAttackTime = gpGlobals->curtime;
-					m_flNextAttack = gpGlobals->curtime + m_flShotDelay - 0.1;
-				}
-				else
-				{
-					TaskComplete();
-				}
-			}
-		}
-	}
-	break;
-
-	default:
-	{
-		BaseClass::RunTask(pTask);
-		break;
-	}
-	}
-}
-
-//------------------------------------------------------------------------------
-// Purpose : Override to always shoot at eyes (for ducking behind things)
-// Input   :
-// Output  :
-//------------------------------------------------------------------------------
-Vector CNPC_Combine::BodyTarget(const Vector& posSrc, bool bNoisy)
-{
-	Vector result = BaseClass::BodyTarget(posSrc, bNoisy);
-
-	// @TODO (toml 02-02-04): this seems wrong. Isn't this already be accounted for 
-	// with the eye position used in the base BodyTarget()
-	if (GetFlags() & FL_DUCKING)
-		result -= Vector(0, 0, 24);
-
-	return result;
-}
-
-//------------------------------------------------------------------------------
-// Purpose:
-//------------------------------------------------------------------------------
-bool CNPC_Combine::FVisible(CBaseEntity* pEntity, int traceMask, CBaseEntity** ppBlocker)
-{
-	if (m_spawnflags & SF_COMBINE_NO_LOOK)
-	{
-		// When no look is set, if enemy has eluded the squad, 
-		// he's always invisble to me
-		if (GetEnemies()->HasEludedMe(pEntity))
-		{
-			return false;
-		}
-	}
-	return BaseClass::FVisible(pEntity, traceMask, ppBlocker);
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::Event_Killed(const CTakeDamageInfo& info)
-{
-	// if I was killed before I could finish throwing my grenade, drop
-	// a grenade item that the player can retrieve.
-	if (GetActivity() == ACT_RANGE_ATTACK2)
-	{
-		if (m_iLastAnimEventHandled != COMBINE_AE_GREN_TOSS)
-		{
-			// Drop the grenade as an item.
-			Vector vecStart;
-			GetAttachment("lefthand", vecStart);
-
-			CBaseEntity* pItem = DropItem("weapon_frag", vecStart, RandomAngle(0, 360));
-
-			if (pItem)
-			{
-				IPhysicsObject* pObj = pItem->VPhysicsGetObject();
-
-				if (pObj)
-				{
-					Vector			vel;
-					vel.x = random->RandomFloat(-100.0f, 100.0f);
-					vel.y = random->RandomFloat(-100.0f, 100.0f);
-					vel.z = random->RandomFloat(800.0f, 1200.0f);
-					AngularImpulse	angImp = RandomAngularImpulse(-300.0f, 300.0f);
-
-					vel[2] = 0.0f;
-					pObj->AddVelocity(&vel, &angImp);
-				}
-
-				// In the Citadel we need to dissolve this
-#ifdef MAPBASE
-				if (PlayerHasMegaPhysCannon() && GlobalEntity_GetCounter("super_phys_gun") != 1)
-#else
-				if (PlayerHasMegaPhysCannon())
-#endif
-				{
-					CBaseCombatWeapon* pWeapon = static_cast<CBaseCombatWeapon*>(pItem);
-
-					pWeapon->Dissolve(NULL, gpGlobals->curtime, false, ENTITY_DISSOLVE_NORMAL);
-				}
-			}
-		}
-	}
-
-	BaseClass::Event_Killed(info);
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Override.  Don't update if I'm not looking
-// Input  :
-// Output : Returns true is new enemy, false is known enemy
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::UpdateEnemyMemory(CBaseEntity* pEnemy, const Vector& position, CBaseEntity* pInformer)
-{
-	if (m_spawnflags & SF_COMBINE_NO_LOOK)
-	{
-		return false;
-	}
-
-	return BaseClass::UpdateEnemyMemory(pEnemy, position, pInformer);
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose: Allows for modification of the interrupt mask for the current schedule.
-//			In the most cases the base implementation should be called first.
-//-----------------------------------------------------------------------------
-void CNPC_Combine::BuildScheduleTestBits(void)
-{
-	BaseClass::BuildScheduleTestBits();
-
-	if (gpGlobals->curtime < m_flNextAttack)
-	{
-		ClearCustomInterruptCondition(COND_CAN_RANGE_ATTACK1);
-		ClearCustomInterruptCondition(COND_CAN_RANGE_ATTACK2);
-	}
-
-	SetCustomInterruptCondition(COND_COMBINE_HIT_BY_BUGBAIT);
-
-	if (!IsCurSchedule(SCHED_COMBINE_BURNING_STAND))
-	{
-		SetCustomInterruptCondition(COND_COMBINE_ON_FIRE);
-	}
-
-#ifdef MAPBASE
-	if (npc_combine_new_cover_behavior.GetBool())
-	{
-		if (IsCurSchedule(SCHED_COMBINE_COMBAT_FAIL))
-		{
-			SetCustomInterruptCondition(COND_NEW_ENEMY);
-			SetCustomInterruptCondition(COND_LIGHT_DAMAGE);
-			SetCustomInterruptCondition(COND_HEAVY_DAMAGE);
-		}
-		else if (IsCurSchedule(SCHED_COMBINE_MOVE_TO_MELEE))
-		{
-			SetCustomInterruptCondition(COND_HEAR_DANGER);
-			SetCustomInterruptCondition(COND_HEAR_MOVE_AWAY);
-		}
-	}
-#endif
-}
-
-
-#ifdef MAPBASE
-//-----------------------------------------------------------------------------
-// Purpose: 
-// Input  : eNewActivity - 
-// Output : Activity
-//-----------------------------------------------------------------------------
-Activity CNPC_Combine::Weapon_TranslateActivity(Activity eNewActivity, bool* pRequired)
-{
-	return BaseClass::Weapon_TranslateActivity(eNewActivity, pRequired);
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-Activity CNPC_Combine::NPC_BackupActivity(Activity eNewActivity)
-{
-	// Some models might not contain ACT_COMBINE_BUGBAIT, which the soldier model uses instead of ACT_IDLE_ON_FIRE.
-	// Contrariwise, soldiers may be called to use ACT_IDLE_ON_FIRE in other parts of the AI and need to translate to ACT_COMBINE_BUGBAIT.
-	if (eNewActivity == ACT_COMBINE_BUGBAIT)
-		return ACT_IDLE_ON_FIRE;
-	else if (eNewActivity == ACT_IDLE_ON_FIRE)
-		return ACT_COMBINE_BUGBAIT;
-
-	return BaseClass::NPC_BackupActivity(eNewActivity);
-}
-#endif
-
-//-----------------------------------------------------------------------------
-// Purpose: Translate base class activities into combot activites
-//-----------------------------------------------------------------------------
-Activity CNPC_Combine::NPC_TranslateActivity(Activity eNewActivity)
-{
-	//Slaming this back to ACT_COMBINE_BUGBAIT since we don't want ANYTHING to change our activity while we burn.
-	if (HasCondition(COND_COMBINE_ON_FIRE))
-		return BaseClass::NPC_TranslateActivity(ACT_COMBINE_BUGBAIT);
-
-	if (eNewActivity == ACT_RANGE_ATTACK2)
-	{
-#ifndef MAPBASE
-		// grunt is going to a secondary long range attack. This may be a thrown 
-		// grenade or fired grenade, we must determine which and pick proper sequence
-		if (Weapon_OwnsThisType("weapon_grenadelauncher"))
-		{
-			return (Activity)ACT_COMBINE_LAUNCH_GRENADE;
-		}
-		else
-#else
-		if (m_bUnderthrow)
-		{
-			return ACT_SPECIAL_ATTACK1;
-		}
-		else
-#endif
-		{
-#if SHARED_COMBINE_ACTIVITIES
-			return ACT_COMBINE_THROW_GRENADE;
-#else
-			return (Activity)ACT_COMBINE_THROW_GRENADE;
-#endif
-		}
-	}
-	else if (eNewActivity == ACT_IDLE)
-	{
-		if (!IsCrouching() && (m_NPCState == NPC_STATE_COMBAT || m_NPCState == NPC_STATE_ALERT))
-		{
-			eNewActivity = ACT_IDLE_ANGRY;
-		}
-	}
-
-	if (m_AssaultBehavior.IsRunning())
-	{
-		switch (eNewActivity)
-		{
-		case ACT_IDLE:
-			eNewActivity = ACT_IDLE_ANGRY;
-			break;
-
-		case ACT_WALK:
-			eNewActivity = ACT_WALK_AIM;
-			break;
-
-		case ACT_RUN:
-			eNewActivity = ACT_RUN_AIM;
-			break;
-		}
-	}
-#ifdef MAPBASE
-	else if (!GetActiveWeapon() && !npc_combine_unarmed_anims.GetBool())
-	{
-		if (eNewActivity == ACT_IDLE || eNewActivity == ACT_IDLE_ANGRY)
-			eNewActivity = ACT_IDLE_SMG1;
-		else if (eNewActivity == ACT_WALK)
-			eNewActivity = ACT_WALK_RIFLE;
-		else if (eNewActivity == ACT_RUN)
-			eNewActivity = ACT_RUN_RIFLE;
-	}
-	else if (m_NPCState == NPC_STATE_IDLE && eNewActivity == ACT_WALK)
-	{
-		if (npc_combine_idle_walk_easy.GetBool())
-		{
-			// ACT_WALK_EASY has been replaced with ACT_WALK_RELAXED for weapon translation purposes
-			eNewActivity = ACT_WALK_RELAXED;
-		}
-		else if (GetActiveWeapon())
-		{
-			eNewActivity = ACT_WALK_RIFLE;
-		}
-	}
-
-	if (eNewActivity == ACT_RUN && (IsCurSchedule(SCHED_TAKE_COVER_FROM_BEST_SOUND) || IsCurSchedule(SCHED_FLEE_FROM_BEST_SOUND)))
-	{
-		if (random->RandomInt(0, 1) && npc_combine_protected_run.GetBool() && HaveSequenceForActivity(ACT_RUN_PROTECTED))
-			eNewActivity = ACT_RUN_PROTECTED;
-	}
-#endif
-
-	return BaseClass::NPC_TranslateActivity(eNewActivity);
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose: Overidden for human grunts because they  hear the DANGER sound
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-int CNPC_Combine::GetSoundInterests(void)
-{
-	return	SOUND_WORLD | SOUND_COMBAT | SOUND_PLAYER | SOUND_DANGER | SOUND_PHYSICS_DANGER | SOUND_BULLET_IMPACT | SOUND_MOVE_AWAY;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Return true if this NPC can hear the specified sound
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::QueryHearSound(CSound* pSound)
-{
-	if (pSound->SoundContext() & SOUND_CONTEXT_COMBINE_ONLY)
-		return true;
-
-	if (pSound->SoundContext() & SOUND_CONTEXT_EXCLUDE_COMBINE)
-		return false;
-
-	return BaseClass::QueryHearSound(pSound);
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose: Announce an assault if the enemy can see me and we are pretty 
-//			close to him/her
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-void CNPC_Combine::AnnounceAssault(void)
-{
-	if (random->RandomInt(0, 5) > 1)
-		return;
-
-	// If enemy can see me make assualt sound
-	CBaseCombatCharacter* pBCC = GetEnemyCombatCharacterPointer();
-
-	if (!pBCC)
-		return;
-
-	if (!FOkToMakeSound())
-		return;
-
-	// Make sure we are pretty close
-	if (WorldSpaceCenter().DistToSqr(pBCC->WorldSpaceCenter()) > (2000 * 2000))
-		return;
-
-	// Make sure we are in view cone of player
-	if (!pBCC->FInViewCone(this))
-		return;
-
-	// Make sure player can see me
-	if (FVisible(pBCC))
-	{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-		SpeakIfAllowed(TLK_CMB_ASSAULT);
-#else
-		m_Sentences.Speak("COMBINE_ASSAULT");
-#endif
-	}
-}
-
-
-void CNPC_Combine::AnnounceEnemyType(CBaseEntity* pEnemy)
-{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	SpeakIfAllowed(TLK_CMB_ENEMY, SENTENCE_PRIORITY_HIGH);
-#else
-	const char* pSentenceName = "COMBINE_MONST";
-	switch (pEnemy->Classify())
-	{
-	case CLASS_PLAYER:
-		pSentenceName = "COMBINE_ALERT";
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	case METROPOLICE_SENTENCE_FREEZE:
+		SpeakIfAllowed( TLK_COP_FREEZE, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
 		break;
 
-	case CLASS_PLAYER_ALLY:
-	case CLASS_CITIZEN_REBEL:
-	case CLASS_CITIZEN_PASSIVE:
-	case CLASS_VORTIGAUNT:
-		pSentenceName = "COMBINE_MONST_CITIZENS";
+	case METROPOLICE_SENTENCE_HES_OVER_HERE:
+		SpeakIfAllowed( TLK_COP_OVER_HERE, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
 		break;
 
-	case CLASS_PLAYER_ALLY_VITAL:
-		pSentenceName = "COMBINE_MONST_CHARACTER";
+	case METROPOLICE_SENTENCE_HES_RUNNING:
+		SpeakIfAllowed( TLK_COP_HES_RUNNING, SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
 		break;
 
-	case CLASS_ANTLION:
-		pSentenceName = "COMBINE_MONST_BUGS";
+	case METROPOLICE_SENTENCE_TAKE_HIM_DOWN:
+		SpeakIfAllowed( TLK_COP_TAKE_HIM_DOWN, SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
 		break;
 
-	case CLASS_ZOMBIE:
-		pSentenceName = "COMBINE_MONST_ZOMBIES";
+	case METROPOLICE_SENTENCE_ARREST_IN_POSITION:
+		SpeakIfAllowed( TLK_COP_ARREST_IN_POS, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
 		break;
 
-	case CLASS_HEADCRAB:
-	case CLASS_BARNACLE:
-		pSentenceName = "COMBINE_MONST_PARASITES";
-		break;
-	}
-
-	m_Sentences.Speak(pSentenceName, SENTENCE_PRIORITY_HIGH);
-#endif
-}
-
-void CNPC_Combine::AnnounceEnemyKill(CBaseEntity* pEnemy)
-{
-	if (!pEnemy)
-		return;
-
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	AI_CriteriaSet set;
-	ModifyOrAppendEnemyCriteria(set, pEnemy);
-	SpeakIfAllowed(TLK_CMB_KILLENEMY, set, SENTENCE_PRIORITY_HIGH);
-#else
-	const char* pSentenceName = "COMBINE_KILL_MONST";
-	switch (pEnemy->Classify())
-	{
-	case CLASS_PLAYER:
-		pSentenceName = "COMBINE_PLAYER_DEAD";
+	case METROPOLICE_SENTENCE_DEPLOY_MANHACK:
+		SpeakIfAllowed( TLK_COP_DEPLOY_MANHACK );
 		break;
 
-		// no sentences for these guys yet
-	case CLASS_PLAYER_ALLY:
-	case CLASS_CITIZEN_REBEL:
-	case CLASS_CITIZEN_PASSIVE:
-	case CLASS_VORTIGAUNT:
-		break;
-
-	case CLASS_PLAYER_ALLY_VITAL:
-		break;
-
-	case CLASS_ANTLION:
-		break;
-
-	case CLASS_ZOMBIE:
-		break;
-
-	case CLASS_HEADCRAB:
-	case CLASS_BARNACLE:
-		break;
-	}
-
-	m_Sentences.Speak(pSentenceName, SENTENCE_PRIORITY_HIGH);
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// Select the combat schedule
-//-----------------------------------------------------------------------------
-int CNPC_Combine::SelectCombatSchedule()
-{
-	// -----------
-	// dead enemy
-	// -----------
-	if (HasCondition(COND_ENEMY_DEAD))
-	{
-		// call base class, all code to handle dead enemies is centralized there.
-		return SCHED_NONE;
-	}
-
-	// -----------
-	// new enemy
-	// -----------
-	if (HasCondition(COND_NEW_ENEMY))
-	{
-		CBaseEntity* pEnemy = GetEnemy();
-		bool bFirstContact = false;
-		float flTimeSinceFirstSeen = gpGlobals->curtime - GetEnemies()->FirstTimeSeen(pEnemy);
-
-		if (flTimeSinceFirstSeen < 3.0f)
-			bFirstContact = true;
-
-		if (m_pSquad && pEnemy)
+	case METROPOLICE_SENTENCE_MOVE_INTO_POSITION:
 		{
-			if (HasCondition(COND_SEE_ENEMY))
-			{
-				AnnounceEnemyType(pEnemy);
-			}
-
-			if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlot(SQUAD_SLOT_ATTACK1))
-			{
-				// Start suppressing if someone isn't firing already (SLOT_ATTACK1). This means
-				// I'm the guy who spotted the enemy, I should react immediately.
-				return SCHED_COMBINE_SUPPRESS;
-			}
-
-			if (m_pSquad->IsLeader(this) || (m_pSquad->GetLeader() && m_pSquad->GetLeader()->GetEnemy() != pEnemy))
-			{
-				// I'm the leader, but I didn't get the job suppressing the enemy. We know this because
-				// This code only runs if the code above didn't assign me SCHED_COMBINE_SUPPRESS.
-				if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-				{
-					return SCHED_RANGE_ATTACK1;
-				}
-
-				if (HasCondition(COND_WEAPON_HAS_LOS) && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-				{
-					// If everyone else is attacking and I have line of fire, wait for a chance to cover someone.
-					if (OccupyStrategySlot(SQUAD_SLOT_OVERWATCH))
-					{
-						return SCHED_COMBINE_ENTER_OVERWATCH;
-					}
-				}
-			}
-			else
-			{
-				if (m_pSquad->GetLeader() && FOkToMakeSound(SENTENCE_PRIORITY_MEDIUM))
-				{
-					JustMadeSound(SENTENCE_PRIORITY_MEDIUM);	// squelch anything that isn't high priority so the leader can speak
-				}
-
-				// First contact, and I'm solo, or not the squad leader.
-				if (HasCondition(COND_SEE_ENEMY) && CanGrenadeEnemy())
-				{
-					if (OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-					{
-						return SCHED_RANGE_ATTACK2;
-					}
-				}
-
-				if (!bFirstContact && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-				{
-					if (random->RandomInt(0, 100) < 60)
-					{
-						return SCHED_ESTABLISH_LINE_OF_FIRE;
-					}
-					else
-					{
-						return SCHED_COMBINE_PRESS_ATTACK;
-					}
-				}
-
-				return SCHED_TAKE_COVER_FROM_ENEMY;
-			}
-		}
-	}
-
-	// ---------------------
-	// no ammo
-	// ---------------------
-	if ((HasCondition(COND_NO_PRIMARY_AMMO) || HasCondition(COND_LOW_PRIMARY_AMMO)) && !HasCondition(COND_CAN_MELEE_ATTACK1))
-	{
-		return SCHED_HIDE_AND_RELOAD;
-	}
-
-	// ----------------------
-	// LIGHT DAMAGE
-	// ----------------------
-	if (HasCondition(COND_LIGHT_DAMAGE))
-	{
-		if (GetEnemy() != NULL)
-		{
-			// only try to take cover if we actually have an enemy!
-
-			// FIXME: need to take cover for enemy dealing the damage
-
-			// A standing guy will either crouch or run.
-			// A crouching guy tries to stay stuck in.
-			if (!IsCrouching())
-			{
-				if (GetEnemy() && random->RandomFloat(0, 100) < 50 && CouldShootIfCrouching(GetEnemy()))
-				{
-					Crouch();
-				}
-				else
-				{
-					//!!!KELLY - this grunt was hit and is going to run to cover.
-					// m_Sentences.Speak( "COMBINE_COVER" );
-					return SCHED_TAKE_COVER_FROM_ENEMY;
-				}
-			}
-		}
-		else
-		{
-			// How am I wounded in combat with no enemy?
-			Assert(GetEnemy() != NULL);
-		}
-	}
-
-	// If I'm scared of this enemy run away
-	if (IRelationType(GetEnemy()) == D_FR)
-	{
-		if (HasCondition(COND_SEE_ENEMY) ||
-			HasCondition(COND_SEE_FEAR) ||
-			HasCondition(COND_LIGHT_DAMAGE) ||
-			HasCondition(COND_HEAVY_DAMAGE))
-		{
-			FearSound();
-			//ClearCommandGoal();
-			return SCHED_RUN_FROM_ENEMY;
-		}
-
-		// If I've seen the enemy recently, cower. Ignore the time for unforgettable enemies.
-		AI_EnemyInfo_t* pMemory = GetEnemies()->Find(GetEnemy());
-		if ((pMemory && pMemory->bUnforgettable) || (GetEnemyLastTimeSeen() > (gpGlobals->curtime - 5.0)))
-		{
-			// If we're facing him, just look ready. Otherwise, face him.
-			if (FInAimCone(GetEnemy()->EyePosition()))
-				return SCHED_COMBAT_STAND;
-
-			return SCHED_FEAR_FACE;
-		}
-	}
-
-	int attackSchedule = SelectScheduleAttack();
-	if (attackSchedule != SCHED_NONE)
-		return attackSchedule;
-
-	if (HasCondition(COND_ENEMY_OCCLUDED))
-	{
-		// stand up, just in case
-		Stand();
-		DesireStand();
-
-		if (GetEnemy() && !(GetEnemy()->GetFlags() & FL_NOTARGET) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-		{
-			// Charge in and break the enemy's cover!
-			return SCHED_ESTABLISH_LINE_OF_FIRE;
-		}
-
-		// If I'm a long, long way away, establish a LOF anyway. Once I get there I'll
-		// start respecting the squad slots again.
-		float flDistSq = GetEnemy()->WorldSpaceCenter().DistToSqr(WorldSpaceCenter());
-		if (flDistSq > Square(3000))
-			return SCHED_ESTABLISH_LINE_OF_FIRE;
-
-		// Otherwise tuck in.
-		Remember(bits_MEMORY_INCOVER);
-		return SCHED_COMBINE_WAIT_IN_COVER;
-	}
-
-	// --------------------------------------------------------------
-	// Enemy not occluded but isn't open to attack
-	// --------------------------------------------------------------
-	if (HasCondition(COND_SEE_ENEMY) && !HasCondition(COND_CAN_RANGE_ATTACK1))
-	{
-		if ((HasCondition(COND_TOO_FAR_TO_ATTACK) || IsUsingTacticalVariant(TACTICAL_VARIANT_PRESSURE_ENEMY)) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-		{
-			return SCHED_COMBINE_PRESS_ATTACK;
-		}
-
-		AnnounceAssault();
-		return SCHED_COMBINE_ASSAULT;
-	}
-
-	return SCHED_NONE;
-}
-
-
-//-----------------------------------------------------------------------------
-// Purpose:
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-int CNPC_Combine::SelectSchedule(void)
-{
-	if (IsWaitingToRappel() && BehaviorSelectSchedule())
-	{
-		return BaseClass::SelectSchedule();
-	}
-
-	if (HasCondition(COND_COMBINE_ON_FIRE))
-		return SCHED_COMBINE_BURNING_STAND;
-
-	int nSched = SelectFlinchSchedule();
-	if (nSched != SCHED_NONE)
-		return nSched;
-
-	if (m_hForcedGrenadeTarget)
-	{
-		if (m_flNextGrenadeCheck < gpGlobals->curtime)
-		{
-			Vector vecTarget = m_hForcedGrenadeTarget->WorldSpaceCenter();
-
-#ifdef MAPBASE
-			// This was switched to IsAltFireCapable() before, but m_bAlternateCapable makes it necessary to use IsElite() again.
-#endif
-			if (IsElite())
-			{
-				if (FVisible(m_hForcedGrenadeTarget))
-				{
-					m_vecAltFireTarget = vecTarget;
-					m_hForcedGrenadeTarget = NULL;
-					return SCHED_COMBINE_AR2_ALTFIRE;
-				}
-			}
-			else
-			{
-				// If we can, throw a grenade at the target. 
-				// Ignore grenade count / distance / etc
-				if (CheckCanThrowGrenade(vecTarget))
-				{
-					m_hForcedGrenadeTarget = NULL;
-					return SCHED_COMBINE_FORCED_GRENADE_THROW;
-				}
-			}
-		}
-
-		// Can't throw at the target, so lets try moving to somewhere where I can see it
-		if (!FVisible(m_hForcedGrenadeTarget))
-		{
-			return SCHED_COMBINE_MOVE_TO_FORCED_GREN_LOS;
-		}
-	}
-
-#ifdef MAPBASE
-	// Drop a grenade?
-	if (HasCondition(COND_COMBINE_DROP_GRENADE))
-		return SCHED_COMBINE_DROP_GRENADE;
-#endif
-
-	if (m_NPCState != NPC_STATE_SCRIPT)
-	{
-		// If we're hit by bugbait, thrash around
-		if (HasCondition(COND_COMBINE_HIT_BY_BUGBAIT))
-		{
-			// Don't do this if we're mounting a func_tank
-			if (m_FuncTankBehavior.IsMounted() == true)
-			{
-				m_FuncTankBehavior.Dismount();
-			}
-
-			ClearCondition(COND_COMBINE_HIT_BY_BUGBAIT);
-			return SCHED_COMBINE_BUGBAIT_DISTRACTION;
-		}
-
-		// We've been told to move away from a target to make room for a grenade to be thrown at it
-		if (HasCondition(COND_HEAR_MOVE_AWAY))
-		{
-			return SCHED_MOVE_AWAY;
-		}
-
-		// These things are done in any state but dead and prone
-		if (m_NPCState != NPC_STATE_DEAD && m_NPCState != NPC_STATE_PRONE)
-		{
-			// Cower when physics objects are thrown at me
-			if (HasCondition(COND_HEAR_PHYSICS_DANGER))
-			{
-				return SCHED_FLINCH_PHYSICS;
-			}
-
+			CBaseEntity *pEntity = GetEnemy();
 			
-			// [MODIFICATION] This is the entire overridden logic block for handling COND_HEAR_DANGER.
-			// It contains the core decision-making for all custom grenade interaction abilities.
-			if (HasCondition(COND_HEAR_DANGER))
+			// NOTE: This is a good time to check to see if the player is hurt.
+			// Have the cops notice this and call out
+			if ( pEntity && !HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) )
 			{
-				// --- PRE-CONDITION CHECKS ---
-
-				// 1. Cooldown Check: First, check if any special ability is on cooldown.
-				// This is the highest priority check to prevent an infinite catch-throw or kick loop.
-				if (gpGlobals->curtime < m_flNextGrenadeCatchTime)
+				if ( pEntity->IsPlayer() && (pEntity->GetHealth() <= 20) )
 				{
-					// If on cooldown, force the default flee behavior and ignore the rest of the logic.
-					return SCHED_TAKE_COVER_FROM_BEST_SOUND;
-				}
-
-				// 2. State Check: Next, check if the soldier is busy reloading.
-				if (GetActivity() == ACT_RELOAD)
-				{
-					// If so, prioritize self-preservation and force the default flee behavior.
-					return SCHED_TAKE_COVER_FROM_BEST_SOUND;
-				}
-
-				// --- DANGER EVALUATION ---
-
-				CSound* pSound;
-				pSound = GetBestSound();
-
-				if (pSound)
-				{
-					if (pSound->m_iType & SOUND_DANGER)
+					if ( !HasMemory(bits_MEMORY_PLAYER_HURT) ) 
 					{
-						// (Original Valve code for speaking is preserved here)
-						// ...
-
-						// --- CUSTOM ABILITY LOGIC ---
-						if (pSound->m_hOwner)
+						if ( SpeakIfAllowed( TLK_COP_PLAYERHIT, SENTENCE_PRIORITY_HIGH ) )
 						{
-							// 3. Target Validation: Ensure the danger sound is from a standard frag grenade.
-							if (strcmp(pSound->m_hOwner->GetClassname(), "npc_grenade_frag") == 0)
-							{
-								// This is the effective radius for any special ability.
-								const float flAbilityRange = 64.0f;
-								float flDist = GetAbsOrigin().DistTo(pSound->m_hOwner->GetAbsOrigin());
-
-								// Check if the grenade is within the effective range.
-								if (flDist <= flAbilityRange)
-								{
-									// 4. 50/50 Random Decision: Randomly choose between the two abilities for variety.
-									if (random->RandomInt(1, 2) == 1)
-									{
-										// 50% chance to perform the "Kick Grenade" ability.
-										return SCHED_COMBINE_KICK_GRENADE;
-									}
-									else
-									{
-										// 50% chance to perform the "Catch and Return" ability.
-										return SCHED_COMBINE_RETURN_GRENADE;
-									}
-								}
-							}
+#ifdef MAPBASE
+							if (GetSquad())
+								GetSquad()->SquadRemember(bits_MEMORY_PLAYER_HURT);
+#else
+							m_pSquad->SquadRemember(bits_MEMORY_PLAYER_HURT);
+#endif
 						}
-
-						// Fallback behavior: If any condition fails (e.g. grenade is too far, not a frag grenade, etc.),
-						// default to the standard flee schedule.
-						return SCHED_TAKE_COVER_FROM_BEST_SOUND;
-					}
-
-					// JAY: This was disabled in HL1.  Test?
-					if (!HasCondition(COND_SEE_ENEMY) && (pSound->m_iType & (SOUND_PLAYER | SOUND_COMBAT)))
-					{
-						GetMotor()->SetIdealYawToTarget(pSound->GetSoundReactOrigin());
 					}
 				}
-			}
-		}
 
-		if (BehaviorSelectSchedule())
-		{
-			return BaseClass::SelectSchedule();
-		}
-	}
-
-	switch (m_NPCState)
-	{
-	case NPC_STATE_IDLE:
-	{
-		if (m_bShouldPatrol)
-			return SCHED_COMBINE_PATROL;
-	}
-	// NOTE: Fall through!
-
-	case NPC_STATE_ALERT:
-	{
-		if (HasCondition(COND_LIGHT_DAMAGE) || HasCondition(COND_HEAVY_DAMAGE))
-		{
-			AI_EnemyInfo_t* pDanger = GetEnemies()->GetDangerMemory();
-			if (pDanger && FInViewCone(pDanger->vLastKnownLocation) && !BaseClass::FVisible(pDanger->vLastKnownLocation))
-			{
-				// I've been hurt, I'm facing the danger, but I don't see it, so move from this position.
-				return SCHED_TAKE_COVER_FROM_ORIGIN;
-			}
-		}
-
-		if (HasCondition(COND_HEAR_COMBAT))
-		{
-			CSound* pSound = GetBestSound();
-
-			if (pSound && pSound->IsSoundType(SOUND_COMBAT))
-			{
-				if (m_pSquad && m_pSquad->GetSquadMemberNearestTo(pSound->GetSoundReactOrigin()) == this && OccupyStrategySlot(SQUAD_SLOT_INVESTIGATE_SOUND))
+				if ( GetNavigator()->GetPath()->GetPathLength() > 20 * 12.0f )
 				{
-					return SCHED_INVESTIGATE_SOUND;
+					SpeakIfAllowed( TLK_COP_FLANK );
 				}
 			}
 		}
-
-		// Don't patrol if I'm in the middle of an assault, because I'll never return to the assault. 
-		if (!m_AssaultBehavior.HasAssaultCue())
-		{
-			if (m_bShouldPatrol || HasCondition(COND_COMBINE_SHOULD_PATROL))
-				return SCHED_COMBINE_PATROL;
-		}
-	}
-	break;
-
-	case NPC_STATE_COMBAT:
-	{
-		int nSched = SelectCombatSchedule();
-		if (nSched != SCHED_NONE)
-			return nSched;
-	}
-	break;
-	}
-
-	// no special cases here, call the base class
-	return BaseClass::SelectSchedule();
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-int CNPC_Combine::SelectFailSchedule(int failedSchedule, int failedTask, AI_TaskFailureCode_t taskFailCode)
-{
-	if (failedSchedule == SCHED_COMBINE_TAKE_COVER1)
-	{
-#ifdef MAPBASE
-		if (IsInSquad() && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2) && HasCondition(COND_SEE_ENEMY)
-			&& (!npc_combine_new_cover_behavior.GetBool() || (taskFailCode == FAIL_NO_COVER)))
-#else
-		if (IsInSquad() && IsStrategySlotRangeOccupied(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2) && HasCondition(COND_SEE_ENEMY))
-#endif
-		{
-			// This eases the effects of an unfortunate bug that usually plagues shotgunners. Since their rate of fire is low,
-			// they spend relatively long periods of time without an attack squad slot. If you corner a shotgunner, usually 
-			// the other memebers of the squad will hog all of the attack slots and pick schedules to move to establish line of
-			// fire. During this time, the shotgunner is prevented from attacking. If he also cannot find cover (the fallback case)
-			// he will stand around like an idiot, right in front of you. Instead of this, we have him run up to you for a melee attack.
-			return SCHED_COMBINE_MOVE_TO_MELEE;
-		}
-	}
-
-	return BaseClass::SelectFailSchedule(failedSchedule, failedTask, taskFailCode);
-}
-
-//-----------------------------------------------------------------------------
-// Should we charge the player?
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::ShouldChargePlayer()
-{
-	return GetEnemy() && GetEnemy()->IsPlayer() && PlayerHasMegaPhysCannon() && !IsLimitingHintGroups();
-}
-
-
-//-----------------------------------------------------------------------------
-// Select attack schedules
-//-----------------------------------------------------------------------------
-#define COMBINE_MEGA_PHYSCANNON_ATTACK_DISTANCE	192
-#define COMBINE_MEGA_PHYSCANNON_ATTACK_DISTANCE_SQ	(COMBINE_MEGA_PHYSCANNON_ATTACK_DISTANCE*COMBINE_MEGA_PHYSCANNON_ATTACK_DISTANCE)
-
-int CNPC_Combine::SelectScheduleAttack()
-{
-#ifndef MAPBASE // Moved to SelectSchedule()
-	// Drop a grenade?
-	if (HasCondition(COND_COMBINE_DROP_GRENADE))
-		return SCHED_COMBINE_DROP_GRENADE;
-#endif
-
-	// Kick attack?
-	if (HasCondition(COND_CAN_MELEE_ATTACK1))
-	{
-		return SCHED_MELEE_ATTACK1;
-	}
-
-	// If I'm fighting a combine turret (it's been hacked to attack me), I can't really
-	// hurt it with bullets, so become grenade happy.
-#ifdef MAPBASE
-	if (GetEnemy() && ((IsUsingTacticalVariant(TACTICAL_VARIANT_GRENADE_HAPPY)) || GetEnemy()->ClassMatches(gm_isz_class_FloorTurret)))
-#else
-	if (GetEnemy() && GetEnemy()->Classify() == CLASS_COMBINE && FClassnameIs(GetEnemy(), "npc_turret_floor"))
-#endif
-	{
-		// Don't do this until I've been fighting the turret for a few seconds
-		float flTimeAtFirstHand = GetEnemies()->TimeAtFirstHand(GetEnemy());
-		if (flTimeAtFirstHand != AI_INVALID_TIME)
-		{
-			float flTimeEnemySeen = gpGlobals->curtime - flTimeAtFirstHand;
-			if (flTimeEnemySeen > 4.0)
-			{
-				if (CanGrenadeEnemy() && OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-					return SCHED_RANGE_ATTACK2;
-			}
-		}
-
-		// If we're not in the viewcone of the turret, run up and hit it. Do this a bit later to
-		// give other squadmembers a chance to throw a grenade before I run in.
-#ifdef MAPBASE
-		// Don't do turret charging of we're just grenade happy.
-		if (!IsUsingTacticalVariant(TACTICAL_VARIANT_GRENADE_HAPPY) && !GetEnemy()->MyNPCPointer()->FInViewCone(this) && OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-#else
-		if (!GetEnemy()->MyNPCPointer()->FInViewCone(this) && OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-#endif
-			return SCHED_COMBINE_CHARGE_TURRET;
-	}
-
-	// When fighting against the player who's wielding a mega-physcannon, 
-	// always close the distance if possible
-	// But don't do it if you're in a nav-limited hint group
-	if (ShouldChargePlayer())
-	{
-		float flDistSq = GetEnemy()->WorldSpaceCenter().DistToSqr(WorldSpaceCenter());
-		if (flDistSq <= COMBINE_MEGA_PHYSCANNON_ATTACK_DISTANCE_SQ)
-		{
-			if (HasCondition(COND_SEE_ENEMY))
-			{
-				if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-					return SCHED_RANGE_ATTACK1;
-			}
-			else
-			{
-				if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-					return SCHED_COMBINE_PRESS_ATTACK;
-			}
-		}
-
-		if (HasCondition(COND_SEE_ENEMY) && !IsUnreachable(GetEnemy()))
-		{
-			return SCHED_COMBINE_CHARGE_PLAYER;
-		}
-	}
-
-	// Can I shoot?
-	if (HasCondition(COND_CAN_RANGE_ATTACK1))
-	{
-
-		// JAY: HL1 behavior missing?
-#if 0
-		if (m_pSquad)
-		{
-			// if the enemy has eluded the squad and a squad member has just located the enemy
-			// and the enemy does not see the squad member, issue a call to the squad to waste a 
-			// little time and give the player a chance to turn.
-			if (MySquadLeader()->m_fEnemyEluded && !HasConditions(bits_COND_ENEMY_FACING_ME))
-			{
-				MySquadLeader()->m_fEnemyEluded = FALSE;
-				return SCHED_GRUNT_FOUND_ENEMY;
-			}
-		}
-#endif
-
-		// Engage if allowed
-		if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-		{
-			return SCHED_RANGE_ATTACK1;
-		}
-
-		// Throw a grenade if not allowed to engage with weapon.
-		if (CanGrenadeEnemy())
-		{
-			if (OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-			{
-				return SCHED_RANGE_ATTACK2;
-			}
-		}
-
-		DesireCrouch();
-		return SCHED_TAKE_COVER_FROM_ENEMY;
-	}
-
-	if (GetEnemy() && !HasCondition(COND_SEE_ENEMY))
-	{
-		// We don't see our enemy. If it hasn't been long since I last saw him,
-		// and he's pretty close to the last place I saw him, throw a grenade in 
-		// to flush him out. A wee bit of cheating here...
-
-		float flTime;
-		float flDist;
-
-		flTime = gpGlobals->curtime - GetEnemies()->LastTimeSeen(GetEnemy());
-		flDist = (GetEnemy()->GetAbsOrigin() - GetEnemies()->LastSeenPosition(GetEnemy())).Length();
-
-		//Msg("Time: %f   Dist: %f\n", flTime, flDist );
-		if (flTime <= COMBINE_GRENADE_FLUSH_TIME && flDist <= COMBINE_GRENADE_FLUSH_DIST && CanGrenadeEnemy(false) && OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-		{
-			return SCHED_RANGE_ATTACK2;
-		}
-	}
-
-	if (HasCondition(COND_WEAPON_SIGHT_OCCLUDED))
-	{
-		// If they are hiding behind something that we can destroy, start shooting at it.
-		CBaseEntity* pBlocker = GetEnemyOccluder();
-		if (pBlocker && pBlocker->GetHealth() > 0 && OccupyStrategySlot(SQUAD_SLOT_ATTACK_OCCLUDER))
-		{
-			return SCHED_SHOOT_ENEMY_COVER;
-		}
-	}
-
-	return SCHED_NONE;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose:
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-int CNPC_Combine::TranslateSchedule(int scheduleType)
-{
-	switch (scheduleType)
-	{
-	case SCHED_TAKE_COVER_FROM_ENEMY:
-	{
-		if (m_pSquad)
-		{
-			// Have to explicitly check innate range attack condition as may have weapon with range attack 2
-			if (g_pGameRules->IsSkillLevel(SKILL_HARD) &&
-				HasCondition(COND_CAN_RANGE_ATTACK2) &&
-				OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-			{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-				SpeakIfAllowed(TLK_CMB_THROWGRENADE);
-#else
-				m_Sentences.Speak("COMBINE_THROW_GRENADE");
-#endif
-				return SCHED_COMBINE_TOSS_GRENADE_COVER1;
-			}
-			else
-			{
-				if (ShouldChargePlayer() && !IsUnreachable(GetEnemy()))
-					return SCHED_COMBINE_CHARGE_PLAYER;
-
-				return SCHED_COMBINE_TAKE_COVER1;
-			}
-		}
-		else
-		{
-			// Have to explicitly check innate range attack condition as may have weapon with range attack 2
-			if (random->RandomInt(0, 1) && HasCondition(COND_CAN_RANGE_ATTACK2))
-			{
-				return SCHED_COMBINE_GRENADE_COVER1;
-			}
-			else
-			{
-				if (ShouldChargePlayer() && !IsUnreachable(GetEnemy()))
-					return SCHED_COMBINE_CHARGE_PLAYER;
-
-				return SCHED_COMBINE_TAKE_COVER1;
-			}
-		}
-	}
-	case SCHED_TAKE_COVER_FROM_BEST_SOUND:
-	{
-		return SCHED_COMBINE_TAKE_COVER_FROM_BEST_SOUND;
-	}
-	break;
-	case SCHED_COMBINE_TAKECOVER_FAILED:
-	{
-		if (HasCondition(COND_CAN_RANGE_ATTACK1) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-		{
-			return TranslateSchedule(SCHED_RANGE_ATTACK1);
-		}
-
-#ifdef MAPBASE
-		if (npc_combine_new_cover_behavior.GetBool() && HasCondition(COND_CAN_RANGE_ATTACK2) && OccupyStrategySlot(SQUAD_SLOT_GRENADE1))
-		{
-			return TranslateSchedule(SCHED_RANGE_ATTACK2);
-		}
-#endif
-
-		// Run somewhere randomly
-		return TranslateSchedule(SCHED_FAIL);
 		break;
-	}
-	break;
-	case SCHED_FAIL_ESTABLISH_LINE_OF_FIRE:
-	{
-		if (!IsCrouching())
+
+	case METROPOLICE_SENTENCE_HEARD_SOMETHING:
+		if ( ( GetState() == NPC_STATE_ALERT ) || ( GetState() == NPC_STATE_IDLE ) )
 		{
-			if (GetEnemy() && CouldShootIfCrouching(GetEnemy()))
+			SpeakIfAllowed( TLK_COP_HEARD_SOMETHING, SENTENCE_PRIORITY_MEDIUM );
+		}
+		break;
+#else
+	case METROPOLICE_SENTENCE_FREEZE:
+		m_Sentences.Speak( "METROPOLICE_FREEZE", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+		break;
+
+	case METROPOLICE_SENTENCE_HES_OVER_HERE:
+		m_Sentences.Speak( "METROPOLICE_OVER_HERE", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+		break;
+
+	case METROPOLICE_SENTENCE_HES_RUNNING:
+		m_Sentences.Speak( "METROPOLICE_HES_RUNNING", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
+		break;
+
+	case METROPOLICE_SENTENCE_TAKE_HIM_DOWN:
+		m_Sentences.Speak( "METROPOLICE_TAKE_HIM_DOWN", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
+		break;
+
+	case METROPOLICE_SENTENCE_ARREST_IN_POSITION:
+		m_Sentences.Speak( "METROPOLICE_ARREST_IN_POS", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+		break;
+
+	case METROPOLICE_SENTENCE_DEPLOY_MANHACK:
+		m_Sentences.Speak( "METROPOLICE_DEPLOY_MANHACK" );
+		break;
+
+	case METROPOLICE_SENTENCE_MOVE_INTO_POSITION:
+		{
+			CBaseEntity *pEntity = GetEnemy();
+			
+			// NOTE: This is a good time to check to see if the player is hurt.
+			// Have the cops notice this and call out
+			if ( pEntity && !HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) )
 			{
-				Crouch();
-				return SCHED_COMBAT_FACE;
-			}
-		}
-
-		if (HasCondition(COND_SEE_ENEMY))
-		{
-			return TranslateSchedule(SCHED_TAKE_COVER_FROM_ENEMY);
-		}
-		else if (!m_AssaultBehavior.HasAssaultCue())
-		{
-			// Don't patrol if I'm in the middle of an assault, because 
-			// I'll never return to the assault. 
-			if (GetEnemy())
-			{
-				RememberUnreachable(GetEnemy());
-			}
-
-			return TranslateSchedule(SCHED_COMBINE_PATROL);
-		}
-	}
-	break;
-	case SCHED_COMBINE_ASSAULT:
-	{
-		CBaseEntity* pEntity = GetEnemy();
-
-		// FIXME: this should be generalized by the schedules that are selected, or in the definition of 
-		// what "cover" means (i.e., trace attack vulnerability vs. physical attack vulnerability
-		if (pEntity && pEntity->MyNPCPointer())
-		{
-			if (!(pEntity->MyNPCPointer()->CapabilitiesGet() & bits_CAP_WEAPON_RANGE_ATTACK1))
-			{
-				return TranslateSchedule(SCHED_ESTABLISH_LINE_OF_FIRE);
-			}
-		}
-		// don't charge forward if there's a hint group
-		if (GetHintGroup() != NULL_STRING)
-		{
-			return TranslateSchedule(SCHED_ESTABLISH_LINE_OF_FIRE);
-		}
-		return SCHED_COMBINE_ASSAULT;
-	}
-	case SCHED_ESTABLISH_LINE_OF_FIRE:
-	{
-		// always assume standing
-		// Stand();
-
-		if (CanAltFireEnemy(true) && OccupyStrategySlot(SQUAD_SLOT_SPECIAL_ATTACK))
-		{
-			// If an elite in the squad could fire a combine ball at the player's last known position,
-			// do so!
-			return SCHED_COMBINE_AR2_ALTFIRE;
-		}
-
-		if (IsUsingTacticalVariant(TACTICAL_VARIANT_PRESSURE_ENEMY) && !IsRunningBehavior())
-		{
-			if (OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-			{
-				return SCHED_COMBINE_PRESS_ATTACK;
-			}
-		}
-
-		return SCHED_COMBINE_ESTABLISH_LINE_OF_FIRE;
-	}
-	break;
-	case SCHED_HIDE_AND_RELOAD:
-	{
-		// stand up, just in case
-		// Stand();
-		// DesireStand();
-		if (CanGrenadeEnemy() && OccupyStrategySlot(SQUAD_SLOT_GRENADE1) && random->RandomInt(0, 100) < 20)
-		{
-			// If I COULD throw a grenade and I need to reload, 20% chance I'll throw a grenade before I hide to reload.
-			return SCHED_COMBINE_GRENADE_AND_RELOAD;
-		}
-
-		// No running away in the citadel!
-		if (ShouldChargePlayer())
-			return SCHED_RELOAD;
-
-		return SCHED_COMBINE_HIDE_AND_RELOAD;
-	}
-	break;
-	case SCHED_RANGE_ATTACK1:
-	{
-		if (HasCondition(COND_NO_PRIMARY_AMMO) || HasCondition(COND_LOW_PRIMARY_AMMO))
-		{
-			// Ditch the strategy slot for attacking (which we just reserved!)
-			VacateStrategySlot();
-			return TranslateSchedule(SCHED_HIDE_AND_RELOAD);
-		}
-
-		if (CanAltFireEnemy(true) && OccupyStrategySlot(SQUAD_SLOT_SPECIAL_ATTACK))
-		{
-			// Since I'm holding this squadslot, no one else can try right now. If I die before the shot 
-			// goes off, I won't have affected anyone else's ability to use this attack at their nearest
-			// convenience.
-			return SCHED_COMBINE_AR2_ALTFIRE;
-		}
-
-		if (IsCrouching() || (CrouchIsDesired() && !HasCondition(COND_HEAVY_DAMAGE)))
-		{
-			// See if we can crouch and shoot
-			if (GetEnemy() != NULL)
-			{
-				float dist = (GetLocalOrigin() - GetEnemy()->GetLocalOrigin()).Length();
-
-				// only crouch if they are relatively far away
-				if (dist > COMBINE_MIN_CROUCH_DISTANCE)
+				if ( pEntity->IsPlayer() && (pEntity->GetHealth() <= 20) )
 				{
-					// try crouching
-					Crouch();
-
-					Vector targetPos = GetEnemy()->BodyTarget(GetActiveWeapon()->GetLocalOrigin());
-
-					// if we can't see it crouched, stand up
-					if (!WeaponLOSCondition(GetLocalOrigin(), targetPos, false))
+					if ( !HasMemory(bits_MEMORY_PLAYER_HURT) ) 
 					{
-						Stand();
+						if ( m_Sentences.Speak( "METROPOLICE_PLAYERHIT", SENTENCE_PRIORITY_HIGH ) >= 0 )
+						{
+							m_pSquad->SquadRemember(bits_MEMORY_PLAYER_HURT);
+						}
 					}
 				}
-			}
-		}
-		else
-		{
-			// always assume standing
-			Stand();
-		}
 
-#ifdef MAPBASE
-		// SCHED_COMBINE_WAIT_IN_COVER uses INCOVER, but only gets out of it when the soldier moves.
-		// That seems to mess up shooting, so this Forget() attempts to fix that.
-		Forget(bits_MEMORY_INCOVER);
-#endif
-
-		return SCHED_COMBINE_RANGE_ATTACK1;
-	}
-	case SCHED_RANGE_ATTACK2:
-	{
-		// If my weapon can range attack 2 use the weapon
-		if (GetActiveWeapon() && GetActiveWeapon()->CapabilitiesGet() & bits_CAP_WEAPON_RANGE_ATTACK2)
-		{
-			return SCHED_RANGE_ATTACK2;
-		}
-		// Otherwise use innate attack
-		else
-		{
-			return SCHED_COMBINE_RANGE_ATTACK2;
-		}
-	}
-	// SCHED_COMBAT_FACE:
-	// SCHED_COMBINE_WAIT_FACE_ENEMY:
-	// SCHED_COMBINE_SWEEP:
-	// SCHED_COMBINE_COVER_AND_RELOAD:
-	// SCHED_COMBINE_FOUND_ENEMY:
-
-	case SCHED_VICTORY_DANCE:
-	{
-		return SCHED_COMBINE_VICTORY_DANCE;
-	}
-	case SCHED_COMBINE_SUPPRESS:
-	{
-#define MIN_SIGNAL_DIST	256
-		if (GetEnemy() != NULL && GetEnemy()->IsPlayer() && m_bFirstEncounter)
-		{
-			float flDistToEnemy = (GetEnemy()->GetAbsOrigin() - GetAbsOrigin()).Length();
-
-			if (flDistToEnemy >= MIN_SIGNAL_DIST)
-			{
-				m_bFirstEncounter = false;// after first encounter, leader won't issue handsigns anymore when he has a new enemy
-				return SCHED_COMBINE_SIGNAL_SUPPRESS;
-			}
-		}
-
-		return SCHED_COMBINE_SUPPRESS;
-	}
-	case SCHED_FAIL:
-	{
-		if (GetEnemy() != NULL)
-		{
-			return SCHED_COMBINE_COMBAT_FAIL;
-		}
-		return SCHED_FAIL;
-	}
-
-	case SCHED_COMBINE_PATROL:
-	{
-		// If I have an enemy, don't go off into random patrol mode.
-		if (GetEnemy() && GetEnemy()->IsAlive())
-			return SCHED_COMBINE_PATROL_ENEMY;
-
-		return SCHED_COMBINE_PATROL;
-	}
-	}
-
-	return BaseClass::TranslateSchedule(scheduleType);
-}
-
-//=========================================================
-//=========================================================
-void CNPC_Combine::OnStartSchedule(int scheduleType)
-{
-}
-
-//=========================================================
-// HandleAnimEvent - catches the monster-specific messages
-// that occur when tagged animation frames are played.
-//=========================================================
-void CNPC_Combine::HandleAnimEvent(animevent_t* pEvent)
-{
-	Vector vecShootDir;
-	Vector vecShootOrigin;
-	bool handledEvent = false;
-
-	if (pEvent->type & AE_TYPE_NEWEVENTSYSTEM)
-	{
-		if (pEvent->event == COMBINE_AE_BEGIN_ALTFIRE)
-		{
-#ifdef MAPBASE
-			if (GetActiveWeapon())
-				GetActiveWeapon()->WeaponSound(SPECIAL1);
-#else
-			EmitSound("Weapon_CombineGuard.Special1");
-#endif
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			SpeakIfAllowed(TLK_CMB_THROWGRENADE, "altfire:1", SENTENCE_PRIORITY_MEDIUM);
-#endif
-			handledEvent = true;
-		}
-		else if (pEvent->event == COMBINE_AE_ALTFIRE)
-		{
-#ifdef MAPBASE
-			if (IsAltFireCapable() && GetActiveWeapon())
-#else
-			if (IsElite())
-#endif
-			{
-				animevent_t fakeEvent;
-				fakeEvent.pSource = this;
-				fakeEvent.event = EVENT_WEAPON_AR2_ALTFIRE;
-				GetActiveWeapon()->Operator_HandleAnimEvent(&fakeEvent, this);
-				DelaySquadAltFireAttack(10.0f);
-			}
-			handledEvent = true;
-		}
-		else
-		{
-			BaseClass::HandleAnimEvent(pEvent);
-		}
-	}
-	else
-	{
-		switch (pEvent->event)
-		{
-		case COMBINE_AE_AIM:
-		{
-			handledEvent = true;
-			break;
-		}
-		case COMBINE_AE_RELOAD:
-			if (GetActiveWeapon())
-			{
-#ifdef MAPBASE
-				GetActiveWeapon()->Reload_NPC();
-#else
-				GetActiveWeapon()->WeaponSound(RELOAD_NPC);
-				GetActiveWeapon()->m_iClip1 = GetActiveWeapon()->GetMaxClip1();
-#endif
-				GetActiveWeapon()->m_iClip2 = GetActiveWeapon()->GetMaxClip2();
-			}
-			ClearCondition(COND_LOW_PRIMARY_AMMO);
-			ClearCondition(COND_NO_PRIMARY_AMMO);
-			ClearCondition(COND_NO_SECONDARY_AMMO);
-			handledEvent = true;
-			break;
-
-			// ▼▼▼ A NOSSA ÚNICA MODIFICAÇÃO ESTÁ NESTE CASE ▼▼▼
-		case COMBINE_AE_GREN_TOSS:
-		{
-					// [CUSTOM LOGIC START]
-			// First, check if the soldier is in the "Return to Sender" state.
-			if (m_bIsReturningGrenade)
-		{
-			// If true, it means we are throwing back a caught grenade using the Task logic.
-			// We must exit immediately to prevent this animation event from creating
-			// a second, duplicate grenade from the inventory.
-			return;
-		}
-		// [CUSTOM LOGIC END]
-
-			// Se não estivermos no modo devolver, o código original da Valve é executado.
-			DevMsg("HandleAnimEvent: GREN_TOSS executado. Arremesso de granada normal da IA.\n");
-
-			Vector vecSpin;
-			vecSpin.x = random->RandomFloat(-1000.0, 1000.0);
-			vecSpin.y = random->RandomFloat(-1000.0, 1000.0);
-			vecSpin.z = random->RandomFloat(-1000.0, 1000.0);
-			Vector vecStart;
-			GetAttachment("lefthand", vecStart);
-			if (m_NPCState == NPC_STATE_SCRIPT)
-			{
-				Vector forward, up, vecThrow;
-				GetVectors(&forward, NULL, &up);
-				vecThrow = forward * 750 + up * 175;
-#ifdef MAPBASE
-				CBaseEntity* pGrenade = Fraggrenade_Create(vecStart, vec3_angle, vecThrow, vecSpin, this, COMBINE_GRENADE_TIMER, true);
-				m_OnThrowGrenade.Set(pGrenade, pGrenade, this);
-#else
-				Fraggrenade_Create(vecStart, vec3_angle, vecThrow, vecSpin, this, COMBINE_GRENADE_TIMER, true);
-#endif
-			}
-			else
-			{
-#ifdef MAPBASE
-				CBaseEntity* pGrenade = Fraggrenade_Create(vecStart, vec3_angle, m_vecTossVelocity, vecSpin, this, COMBINE_GRENADE_TIMER, true);
-				m_OnThrowGrenade.Set(pGrenade, pGrenade, this);
-				AddGrenades(-1, pGrenade);
-#else
-				Fraggrenade_Create(vecStart, vec3_angle, m_vecTossVelocity, vecSpin, this, COMBINE_GRENADE_TIMER, true);
-				m_iNumGrenades--;
-#endif
-			}
-			m_flNextGrenadeCheck = gpGlobals->curtime + 6;
-		}
-		handledEvent = true;
-		break;
-
-		case COMBINE_AE_GREN_LAUNCH:
-		{
-			EmitSound("NPC_Combine.GrenadeLaunch");
-			CBaseEntity* pGrenade = CreateNoSpawn("npc_contactgrenade", Weapon_ShootPosition(), vec3_angle, this);
-			pGrenade->KeyValue("velocity", m_vecTossVelocity);
-			pGrenade->Spawn();
-
-			if (g_pGameRules->IsSkillLevel(SKILL_HARD))
-				m_flNextGrenadeCheck = gpGlobals->curtime + random->RandomFloat(2, 5);
-			else
-				m_flNextGrenadeCheck = gpGlobals->curtime + 6;
-		}
-		handledEvent = true;
-		break;
-
-		case COMBINE_AE_GREN_DROP:
-		{
-			Vector vecStart;
-#ifdef MAPBASE
-			QAngle angStart;
-			m_vecTossVelocity.x = 15;
-			m_vecTossVelocity.y = 0;
-			m_vecTossVelocity.z = 0;
-			GetAttachment("lefthand", vecStart, angStart);
-			CBaseEntity* pGrenade = NULL;
-			if (m_NPCState == NPC_STATE_SCRIPT)
-			{
-				pGrenade = Fraggrenade_Create(vecStart, vec3_angle, m_vecTossVelocity, vec3_origin, this, COMBINE_GRENADE_TIMER, true);
-			}
-			else
-			{
-				pGrenade = Fraggrenade_Create(vecStart, angStart, m_vecTossVelocity, vec3_origin, this, COMBINE_GRENADE_TIMER, true);
-				AddGrenades(-1);
-			}
-			m_OnThrowGrenade.Set(pGrenade, pGrenade, this);
-#else
-			GetAttachment("lefthand", vecStart);
-			Fraggrenade_Create(vecStart, vec3_angle, m_vecTossVelocity, vec3_origin, this, COMBINE_GRENADE_TIMER, true);
-			m_iNumGrenades--;
-#endif
-		}
-		handledEvent = true;
-		break;
-
-		case COMBINE_AE_KICK:
-		{
-			CBaseEntity* pHurt = CheckTraceHullAttack(70, -Vector(16, 16, 18), Vector(16, 16, 18), 0, DMG_CLUB);
-			CBaseCombatCharacter* pBCC = ToBaseCombatCharacter(pHurt);
-			if (pBCC)
-			{
-				Vector forward, up;
-				AngleVectors(GetLocalAngles(), &forward, NULL, &up);
-				if (!pBCC->DispatchInteraction(g_interactionCombineBash, NULL, this))
+				if ( GetNavigator()->GetPath()->GetPathLength() > 20 * 12.0f )
 				{
-					if (pBCC->IsPlayer())
-					{
-						pBCC->ViewPunch(QAngle(-12, -7, 0));
-						pHurt->ApplyAbsVelocityImpulse(forward * 100 + up * 50);
-					}
-					CTakeDamageInfo info(this, this, m_nKickDamage, DMG_CLUB);
-					CalculateMeleeDamageForce(&info, forward, pBCC->GetAbsOrigin());
-					pBCC->TakeDamage(info);
-					EmitSound("NPC_Combine.WeaponBash");
+					m_Sentences.Speak( "METROPOLICE_FLANK" );
 				}
 			}
-
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			SpeakIfAllowed(TLK_CMB_KICK);
-#else
-			m_Sentences.Speak("COMBINE_KICK");
-#endif
-			handledEvent = true;
-			break;
-		}
-
-		case COMBINE_AE_CAUGHT_ENEMY:
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			SpeakIfAllowed(TLK_CMB_ENEMY);
-#else
-			m_Sentences.Speak("COMBINE_ALERT");
-#endif
-			handledEvent = true;
-			break;
-
-
-		default:
-			BaseClass::HandleAnimEvent(pEvent);
-			break;
-		}
-	}
-
-	if (handledEvent)
-	{
-		m_iLastAnimEventHandled = pEvent->event;
-	}
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Get shoot position of BCC at an arbitrary position
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-Vector CNPC_Combine::Weapon_ShootPosition()
-{
-	bool bStanding = !IsCrouching();
-	Vector right;
-	GetVectors(NULL, &right, NULL);
-
-	if ((CapabilitiesGet() & bits_CAP_DUCK))
-	{
-		if (IsCrouchedActivity(GetActivity()))
-		{
-			bStanding = false;
-		}
-	}
-
-	// FIXME: rename this "estimated" since it's not based on animation
-	// FIXME: the orientation won't be correct when testing from arbitary positions for arbitary angles
-
-#ifdef MAPBASE
-	// HACKHACK: This weapon shoot position code does not work properly when in close range, causing the aim
-	// to drift to the left as the enemy gets closer to it.
-	// This problem is usually bearable for regular combat, but it causes dynamic interaction yaw to be offset
-	// as well, preventing most from ever being triggered.
-	// Ideally, this should be fixed from the root cause, but due to the sensitivity of such a change, this is
-	// currently being tied to a cvar which is off by default.
-	// 
-	// If the cvar is disabled but the soldier has valid interactions on its current enemy, then a separate hack
-	// will still attempt to correct the drift as the enemy gets closer.
-	if (npc_combine_fixed_shootpos.GetBool())
-	{
-		right *= 0.0f;
-	}
-	else if (HasValidInteractionsOnCurrentEnemy())
-	{
-		float flDistSqr = GetEnemy()->WorldSpaceCenter().DistToSqr(WorldSpaceCenter());
-		if (flDistSqr < Square(128.0f))
-			right *= (flDistSqr / Square(128.0f));
-	}
-#endif
-
-	if (bStanding)
-	{
-		if (HasShotgun())
-		{
-			return GetAbsOrigin() + COMBINE_SHOTGUN_STANDING_POSITION + right * 8;
-		}
-		else
-		{
-			return GetAbsOrigin() + COMBINE_GUN_STANDING_POSITION + right * 8;
-		}
-	}
-	else
-	{
-		if (HasShotgun())
-		{
-			return GetAbsOrigin() + COMBINE_SHOTGUN_CROUCHING_POSITION + right * 8;
-		}
-		else
-		{
-			return GetAbsOrigin() + COMBINE_GUN_CROUCHING_POSITION + right * 8;
-		}
-	}
-}
-
-
-//=========================================================
-// Speak Sentence - say your cued up sentence.
-//
-// Some grunt sentences (take cover and charge) rely on actually
-// being able to execute the intended action. It's really lame
-// when a grunt says 'COVER ME' and then doesn't move. The problem
-// is that the sentences were played when the decision to TRY
-// to move to cover was made. Now the sentence is played after 
-// we know for sure that there is a valid path. The schedule
-// may still fail but in most cases, well after the grunt has 
-// started moving.
-//=========================================================
-void CNPC_Combine::SpeakSentence(int sentenceType)
-{
-	switch (sentenceType)
-	{
-	case 0: // assault
-		AnnounceAssault();
-		break;
-
-	case 1: // Flanking the player
-		// If I'm moving more than 20ft, I need to talk about it
-		if (GetNavigator()->GetPath()->GetPathLength() > 20 * 12.0f)
-		{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			SpeakIfAllowed(TLK_CMB_FLANK);
-#else
-			m_Sentences.Speak("COMBINE_FLANK");
-#endif
 		}
 		break;
+
+	case METROPOLICE_SENTENCE_HEARD_SOMETHING:
+		if ( ( GetState() == NPC_STATE_ALERT ) || ( GetState() == NPC_STATE_IDLE ) )
+		{
+			m_Sentences.Speak( "METROPOLICE_HEARD_SOMETHING", SENTENCE_PRIORITY_MEDIUM );
+		}
+		break;
+#endif
 	}
 }
 
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
 //=========================================================
-bool CNPC_Combine::SpeakIfAllowed(const char* concept, const char* modifiers, SentencePriority_t sentencepriority, SentenceCriteria_t sentencecriteria)
+//=========================================================
+bool CNPC_MetroPolice::SpeakIfAllowed( const char *concept, const char *modifiers, SentencePriority_t sentencepriority, SentenceCriteria_t sentencecriteria )
 {
 	AI_CriteriaSet set;
 	if (modifiers)
 	{
 #ifdef NEW_RESPONSE_SYSTEM
-		GatherCriteria(&set, concept, modifiers);
+		GatherCriteria( &set, concept, modifiers );
 #else
 		GetExpresser()->MergeModifiers(set, modifiers);
 #endif
 	}
-	return SpeakIfAllowed(concept, set, sentencepriority, sentencecriteria);
+	return SpeakIfAllowed( concept, set, sentencepriority, sentencecriteria );
 }
 
 //=========================================================
 //=========================================================
-bool CNPC_Combine::SpeakIfAllowed(const char* concept, AI_CriteriaSet& modifiers, SentencePriority_t sentencepriority, SentenceCriteria_t sentencecriteria)
+bool CNPC_MetroPolice::SpeakIfAllowed( const char *concept, AI_CriteriaSet& modifiers, SentencePriority_t sentencepriority, SentenceCriteria_t sentencecriteria )
 {
-	if (sentencepriority != SENTENCE_PRIORITY_INVALID && !FOkToMakeSound(sentencepriority))
+	if ( sentencepriority != SENTENCE_PRIORITY_INVALID && !FOkToMakeSound( sentencepriority ) )
 		return false;
 
-	if (!GetExpresser()->CanSpeakConcept(concept))
+	if ( !GetExpresser()->CanSpeakConcept( concept ) )
 		return false;
 
-	// Don't interrupt scripted VCD dialogue
-	if (IsRunningScriptedSceneWithSpeechAndNotPaused(this, true))
-		return false;
-
-	if (Speak(concept, modifiers))
+	if ( Speak( concept, modifiers ) )
 	{
-		JustMadeSound(sentencepriority, 2.0f /*GetTimeSpeechComplete()*/);
+		JustMadeSound( sentencepriority, 2.0f /*GetTimeSpeechComplete()*/ );
 		return true;
 	}
 
@@ -3325,803 +1212,2292 @@ bool CNPC_Combine::SpeakIfAllowed(const char* concept, AI_CriteriaSet& modifiers
 
 //-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
-void CNPC_Combine::ModifyOrAppendCriteria(AI_CriteriaSet& set)
+void CNPC_MetroPolice::ModifyOrAppendCriteria( AI_CriteriaSet& set )
 {
-	BaseClass::ModifyOrAppendCriteria(set);
+	BaseClass::ModifyOrAppendCriteria( set );
 
-	set.AppendCriteria("numgrenades", UTIL_VarArgs("%d", m_iNumGrenades));
-
-	if (IsElite())
-	{
-		set.AppendCriteria("elite", "1");
-	}
-	else
-	{
-		set.AppendCriteria("elite", "0");
-	}
+	set.AppendCriteria( "numwarnings", UTIL_VarArgs("%d", m_nNumWarnings) );
 }
 #endif
 
-//=========================================================
-// PainSound
-//=========================================================
-#ifdef MAPBASE
-void CNPC_Combine::PainSound(const CTakeDamageInfo& info)
-#else
-void CNPC_Combine::PainSound(void)
-#endif
+
+//-----------------------------------------------------------------------------
+// Speaking
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AnnounceEnemyType( CBaseEntity *pEnemy )
 {
-	// NOTE: The response system deals with this at the moment
-	if (GetFlags() & FL_DISSOLVING)
+	if ( !pEnemy || !m_pSquad )
 		return;
 
-	if (gpGlobals->curtime > m_flNextPainSoundTime)
+	// Don't announce enemies when the player isn't a criminal
+	if ( !PlayerIsCriminal() )
+		return;
+
+	// Don't announce enemies when I'm in arrest behavior
+	if ( HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) )
+		return;
+
+	if ( m_pSquad->IsLeader( this ) || ( m_pSquad->GetLeader() && m_pSquad->GetLeader()->GetEnemy() != GetEnemy() ) )
 	{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-		AI_CriteriaSet set;
-		ModifyOrAppendDamageCriteria(set, info);
-		SpeakIfAllowed(TLK_CMB_PAIN, set, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS);
-#else
-		const char* pSentenceName = "COMBINE_PAIN";
-		float healthRatio = (float)GetHealth() / (float)GetMaxHealth();
-		if (!HasMemory(bits_MEMORY_PAIN_LIGHT_SOUND) && healthRatio > 0.9)
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+		// First contact, and I'm the squad leader.
+		bool bEnemyInVehicle = false;
+		switch ( pEnemy->Classify() )
 		{
-			Remember(bits_MEMORY_PAIN_LIGHT_SOUND);
-			pSentenceName = "COMBINE_TAUNT";
-		}
-		else if (!HasMemory(bits_MEMORY_PAIN_HEAVY_SOUND) && healthRatio < 0.25)
-		{
-			Remember(bits_MEMORY_PAIN_HEAVY_SOUND);
-			pSentenceName = "COMBINE_COVER";
-		}
-
-		m_Sentences.Speak(pSentenceName, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS);
-#endif
-		m_flNextPainSoundTime = gpGlobals->curtime + 1;
-	}
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: implemented by subclasses to give them an opportunity to make
-//			a sound when they lose their enemy
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-#ifdef MAPBASE
-void CNPC_Combine::LostEnemySound(CBaseEntity* pEnemy)
-#else
-void CNPC_Combine::LostEnemySound(void)
-#endif
-{
-	if (gpGlobals->curtime <= m_flNextLostSoundTime)
-		return;
-
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	AI_CriteriaSet modifiers;
-	ModifyOrAppendEnemyCriteria(modifiers, pEnemy);
-
-	modifiers.AppendCriteria("lastseenenemy", gpGlobals->curtime - GetEnemies()->LastTimeSeen(pEnemy));
-
-	if (SpeakIfAllowed(TLK_CMB_LOSTENEMY, modifiers))
-	{
-		m_flNextLostSoundTime = gpGlobals->curtime + random->RandomFloat(5.0, 15.0);
-	}
-#else
-	const char* pSentence;
-	if (!(CBaseEntity*)GetEnemy() || gpGlobals->curtime - GetEnemyLastTimeSeen() > 10)
-	{
-		pSentence = "COMBINE_LOST_LONG";
-	}
-	else
-	{
-		pSentence = "COMBINE_LOST_SHORT";
-	}
-
-	if (m_Sentences.Speak(pSentence) >= 0)
-	{
-		m_flNextLostSoundTime = gpGlobals->curtime + random->RandomFloat(5.0, 15.0);
-	}
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: implemented by subclasses to give them an opportunity to make
-//			a sound when they lose their enemy
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-#ifdef MAPBASE
-void CNPC_Combine::FoundEnemySound(CBaseEntity* pEnemy)
-#else
-void CNPC_Combine::FoundEnemySound(void)
-#endif
-{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	AI_CriteriaSet modifiers;
-	ModifyOrAppendEnemyCriteria(modifiers, pEnemy);
-
-	SpeakIfAllowed(TLK_CMB_REFINDENEMY, modifiers, SENTENCE_PRIORITY_HIGH);
-#else
-	m_Sentences.Speak("COMBINE_REFIND_ENEMY", SENTENCE_PRIORITY_HIGH);
-#endif
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Implemented by subclasses to give them an opportunity to make
-//			a sound before they attack
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-
-// BUGBUG: It looks like this is never played because combine don't do SCHED_WAKE_ANGRY or anything else that does a TASK_SOUND_WAKE
-void CNPC_Combine::AlertSound(void)
-{
-	if (gpGlobals->curtime > m_flNextAlertSoundTime)
-	{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-		SpeakIfAllowed(TLK_CMB_GOALERT, SENTENCE_PRIORITY_HIGH);
-#else
-		m_Sentences.Speak("COMBINE_GO_ALERT", SENTENCE_PRIORITY_HIGH);
-#endif
-		m_flNextAlertSoundTime = gpGlobals->curtime + 10.0f;
-	}
-}
-
-//=========================================================
-// NotifyDeadFriend
-//=========================================================
-void CNPC_Combine::NotifyDeadFriend(CBaseEntity* pFriend)
-{
-#ifndef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	if (GetSquad()->NumMembers() < 2)
-	{
-		m_Sentences.Speak("COMBINE_LAST_OF_SQUAD", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_NORMAL);
-		JustMadeSound();
-		return;
-	}
-#endif
-	// relaxed visibility test so that guys say this more often
-	//if( FInViewCone( pFriend ) && FVisible( pFriend ) )
-	{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-		SpeakIfAllowed(TLK_CMB_MANDOWN);
-#else
-		m_Sentences.Speak("COMBINE_MAN_DOWN");
-#endif
-	}
-	BaseClass::NotifyDeadFriend(pFriend);
-}
-
-//=========================================================
-// DeathSound 
-//=========================================================
-#ifdef MAPBASE
-void CNPC_Combine::DeathSound(const CTakeDamageInfo& info)
-#else
-void CNPC_Combine::DeathSound(void)
-#endif
-{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-	AI_CriteriaSet set;
-	ModifyOrAppendDamageCriteria(set, info);
-	SpeakIfAllowed(TLK_CMB_DIE, set, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS);
-#else
-	// NOTE: The response system deals with this at the moment
-	if (GetFlags() & FL_DISSOLVING)
-		return;
-
-	m_Sentences.Speak("COMBINE_DIE", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS);
-#endif
-}
-
-//=========================================================
-// IdleSound 
-//=========================================================
-void CNPC_Combine::IdleSound(void)
-{
-	if (g_fCombineQuestion || random->RandomInt(0, 1))
-	{
-		if (!g_fCombineQuestion)
-		{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			int iRandom = random->RandomInt(0, 2);
-			SpeakIfAllowed(TLK_CMB_QUESTION, UTIL_VarArgs("combinequestion:%d", iRandom));
-			g_fCombineQuestion = iRandom + 1;
-#else
-			// ask question or make statement
-			switch (random->RandomInt(0, 2))
+		case CLASS_PLAYER:
 			{
-			case 0: // check in
-				if (m_Sentences.Speak("COMBINE_CHECK") >= 0)
+				CBasePlayer *pPlayer = assert_cast<CBasePlayer*>( pEnemy );
+				if ( pPlayer && pPlayer->IsInAVehicle() )
 				{
-					g_fCombineQuestion = 1;
+					bEnemyInVehicle = true;
 				}
-				break;
-
-			case 1: // question
-				if (m_Sentences.Speak("COMBINE_QUEST") >= 0)
-				{
-					g_fCombineQuestion = 2;
-				}
-				break;
-
-			case 2: // statement
-				m_Sentences.Speak("COMBINE_IDLE");
-				break;
 			}
+			break;
+		}
+
+		SpeakIfAllowed( TLK_COP_ENEMY, UTIL_VarArgs("enemy_in_vehicle:%d", bEnemyInVehicle), SENTENCE_PRIORITY_HIGH );
+#else
+		// First contact, and I'm the squad leader.
+		const char *pSentenceName = "METROPOLICE_MONST";
+		switch ( pEnemy->Classify() )
+		{
+		case CLASS_PLAYER:
+			{
+				CBasePlayer *pPlayer = assert_cast<CBasePlayer*>( pEnemy );
+				if ( pPlayer && pPlayer->IsInAVehicle() )
+				{
+					pSentenceName = "METROPOLICE_MONST_PLAYER_VEHICLE";
+				}
+				else
+				{
+					pSentenceName = "METROPOLICE_MONST_PLAYER";
+				}
+			}
+			break;
+
+		case CLASS_PLAYER_ALLY:
+		case CLASS_CITIZEN_REBEL:
+		case CLASS_CITIZEN_PASSIVE:
+		case CLASS_VORTIGAUNT:
+			pSentenceName = "METROPOLICE_MONST_CITIZENS";
+			break;
+
+		case CLASS_PLAYER_ALLY_VITAL:
+			pSentenceName = "METROPOLICE_MONST_CHARACTER";
+			break;
+
+		case CLASS_ANTLION:
+			pSentenceName = "METROPOLICE_MONST_BUGS";
+			break;
+
+		case CLASS_ZOMBIE:
+			pSentenceName = "METROPOLICE_MONST_ZOMBIES";
+			break;
+
+		case CLASS_HEADCRAB:
+		case CLASS_BARNACLE:
+			pSentenceName = "METROPOLICE_MONST_PARASITES";
+			break;
+		}
+
+		m_Sentences.Speak( pSentenceName, SENTENCE_PRIORITY_HIGH );
 #endif
+	}
+	else
+	{
+		if ( m_pSquad->GetLeader() && FOkToMakeSound( SENTENCE_PRIORITY_MEDIUM ) )
+		{
+			// squelch anything that isn't high priority so the leader can speak
+			JustMadeSound( SENTENCE_PRIORITY_MEDIUM );	
+		}
+	}
+
+}
+
+
+//-----------------------------------------------------------------------------
+// Speaking
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AnnounceEnemyKill( CBaseEntity *pEnemy )
+{
+	if ( !pEnemy )
+		return;
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	AI_CriteriaSet set;
+	ModifyOrAppendEnemyCriteria(set, pEnemy);
+	SpeakIfAllowed( TLK_COP_KILLENEMY, set, SENTENCE_PRIORITY_HIGH );
+#else
+	const char *pSentenceName = "METROPOLICE_KILL_MONST";
+	switch ( pEnemy->Classify() )
+	{
+	case CLASS_PLAYER:
+		pSentenceName = "METROPOLICE_KILL_PLAYER";
+		break;
+
+	// no sentences for these guys yet
+	case CLASS_PLAYER_ALLY:
+	case CLASS_CITIZEN_REBEL:
+	case CLASS_CITIZEN_PASSIVE:
+	case CLASS_VORTIGAUNT:
+		pSentenceName = "METROPOLICE_KILL_CITIZENS";
+		break;
+
+	case CLASS_PLAYER_ALLY_VITAL:
+		pSentenceName = "METROPOLICE_KILL_CHARACTER";
+		break;
+
+	case CLASS_ANTLION:
+		pSentenceName = "METROPOLICE_KILL_BUGS";
+		break;
+
+	case CLASS_ZOMBIE:
+		pSentenceName = "METROPOLICE_KILL_ZOMBIES";
+		break;
+
+	case CLASS_HEADCRAB:
+	case CLASS_BARNACLE:
+		pSentenceName = "METROPOLICE_KILL_PARASITES";
+		break;
+	}
+
+	m_Sentences.Speak( pSentenceName, SENTENCE_PRIORITY_HIGH );
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Announce out of ammo
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AnnounceOutOfAmmo( )
+{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	if ( HasCondition( COND_NO_PRIMARY_AMMO ) )
+	{
+		SpeakIfAllowed( TLK_COP_NOAMMO );
+	}
+	else
+	{
+		SpeakIfAllowed( TLK_COP_LOWAMMO );
+	}
+#else
+	if ( HasCondition( COND_NO_PRIMARY_AMMO ) )
+	{
+		m_Sentences.Speak( "METROPOLICE_COVER_NO_AMMO" );
+	}
+	else
+	{
+		m_Sentences.Speak( "METROPOLICE_COVER_LOW_AMMO" );
+	}
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// We're taking cover from danger
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AnnounceTakeCoverFromDanger( CSound *pSound )
+{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	bool bGrenade = false;
+	bool bVehicle = false;
+	bool bManhack = false;
+
+	CBaseEntity *pSoundOwner = pSound->m_hOwner;
+	if ( pSoundOwner )
+	{
+		CBaseGrenade *pGrenade = dynamic_cast<CBaseGrenade *>(pSoundOwner);
+		if ( pGrenade )
+		{
+			if ( IRelationType( pGrenade->GetThrower() ) != D_LI )
+			{
+				// special case call out for enemy grenades
+				bGrenade = true;
+			}
+		}
+		else if ( pSoundOwner->GetServerVehicle() )
+		{
+			bVehicle = true;
+		}
+		else if ( FClassnameIs( pSoundOwner, "npc_manhack" ) )
+		{
+			if ( pSoundOwner->HasPhysicsAttacker( 1.0f ) )
+			{
+				bManhack = true;
+			}
+		}
+	}
+
+	SpeakIfAllowed(TLK_COP_DANGER, UTIL_VarArgs("grenade:%d,vehicle:%d,manhack:%d", bGrenade, bVehicle, bManhack), SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL);
+#else
+	CBaseEntity *pSoundOwner = pSound->m_hOwner;
+	if ( pSoundOwner )
+	{
+		CBaseGrenade *pGrenade = dynamic_cast<CBaseGrenade *>(pSoundOwner);
+		if ( pGrenade )
+		{
+			if ( IRelationType( pGrenade->GetThrower() ) != D_LI )
+			{
+				// special case call out for enemy grenades
+				m_Sentences.Speak( "METROPOLICE_DANGER_GREN", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
+			}
+			return;
+		}
+
+		if ( pSoundOwner->GetServerVehicle() )
+		{
+			m_Sentences.Speak( "METROPOLICE_DANGER_VEHICLE", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
+			return;
+		}
+
+		if ( FClassnameIs( pSoundOwner, "npc_manhack" ) )
+		{
+			if ( pSoundOwner->HasPhysicsAttacker( 1.0f ) )
+			{
+				m_Sentences.Speak( "METROPOLICE_DANGER_MANHACK", SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
+			}
+			return;
+		}
+	}
+
+	// I hear something dangerous, probably need to take cover.
+	// dangerous sound nearby!, call it out
+	const char *pSentenceName = "METROPOLICE_DANGER";
+	m_Sentences.Speak( pSentenceName, SENTENCE_PRIORITY_HIGH, SENTENCE_CRITERIA_NORMAL );
+#endif
+}
+
+
+				
+//-----------------------------------------------------------------------------
+// Are we currently firing a burst?
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::IsCurrentlyFiringBurst() const
+{
+	return (m_nBurstMode != BURST_NOT_ACTIVE);
+}
+
+
+//-----------------------------------------------------------------------------
+// Is my enemy currently in an airboat?
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::IsEnemyInAnAirboat() const
+{
+	// Should this be a condition??
+	if ( !GetEnemy() || !GetEnemy()->IsPlayer() )
+		return false;
+
+	CBaseEntity *pVehicle = static_cast<CBasePlayer*>( GetEnemy() )->GetVehicleEntity(); 
+	if ( !pVehicle )
+		return false;
+
+	// NOTE: Could just return true if in a vehicle maybe
+	return FClassnameIs( pVehicle, "prop_vehicle_airboat" );
+}
+
+
+//-----------------------------------------------------------------------------
+// Returns the airboat
+//-----------------------------------------------------------------------------
+CBaseEntity *CNPC_MetroPolice::GetEnemyAirboat() const
+{
+	// Should this be a condition??
+	if ( !GetEnemy() || !GetEnemy()->IsPlayer() )
+		return NULL;
+
+	return static_cast<CBasePlayer*>( GetEnemy() )->GetVehicleEntity(); 
+}
+
+
+//-----------------------------------------------------------------------------
+// Which entity are we actually trying to shoot at?
+//-----------------------------------------------------------------------------
+CBaseEntity *CNPC_MetroPolice::GetShootTarget()
+{
+	// Should this be a condition??
+	CBaseEntity *pEnemy = GetEnemy();
+	if ( !pEnemy || !pEnemy->IsPlayer() )
+		return pEnemy;
+
+	CBaseEntity *pVehicle = static_cast<CBasePlayer*>( pEnemy )->GetVehicleEntity(); 
+	return pVehicle ? pVehicle : pEnemy;
+}
+
+
+//-----------------------------------------------------------------------------
+// Set up the shot regulator based on the equipped weapon
+//-----------------------------------------------------------------------------
+
+// Ranges across which to tune fire rates
+const float MIN_PISTOL_MODIFY_DIST = 15 * 12;
+const float MAX_PISTOL_MODIFY_DIST = 150 * 12;
+
+// Range for rest period minimums
+const float MIN_MIN_PISTOL_REST_INTERVAL = 0.6;
+const float MAX_MIN_PISTOL_REST_INTERVAL = 1.2;
+
+// Range for rest period maximums
+const float MIN_MAX_PISTOL_REST_INTERVAL = 1.2;
+const float MAX_MAX_PISTOL_REST_INTERVAL = 2.0;
+
+// Range for burst minimums
+const int 	MIN_MIN_PISTOL_BURST = 2;
+const int 	MAX_MIN_PISTOL_BURST = 4;
+
+// Range for burst maximums
+const int 	MIN_MAX_PISTOL_BURST = 5;
+const int 	MAX_MAX_PISTOL_BURST = 8;
+
+void CNPC_MetroPolice::OnUpdateShotRegulator( )
+{
+	BaseClass::OnUpdateShotRegulator();
+
+	// FIXME: This code (except the burst interval) could be used for all weapon types 
+#ifdef MAPBASE
+	// Only if we actually have the pistol out
+	if ( GetActiveWeapon() && EntIsClass( GetActiveWeapon(), gm_isz_class_Pistol ) )
+#else
+	if( Weapon_OwnsThisType( "weapon_pistol" ) )
+#endif
+	{
+		if ( m_nBurstMode == BURST_NOT_ACTIVE )
+		{
+			if ( GetEnemy() )
+			{
+				float dist = WorldSpaceCenter().DistTo( GetEnemy()->WorldSpaceCenter() );
+				
+				dist = clamp( dist, MIN_PISTOL_MODIFY_DIST, MAX_PISTOL_MODIFY_DIST );
+				
+				float factor = (dist - MIN_PISTOL_MODIFY_DIST) / (MAX_PISTOL_MODIFY_DIST - MIN_PISTOL_MODIFY_DIST);
+				
+				int		nMinBurst			= MIN_MIN_PISTOL_BURST + ( MAX_MIN_PISTOL_BURST - MIN_MIN_PISTOL_BURST ) * (1.0 - factor);
+				int		nMaxBurst			= MIN_MAX_PISTOL_BURST + ( MAX_MAX_PISTOL_BURST - MIN_MAX_PISTOL_BURST ) * (1.0 - factor);
+				float	flMinRestInterval	= MIN_MIN_PISTOL_REST_INTERVAL + ( MAX_MIN_PISTOL_REST_INTERVAL - MIN_MIN_PISTOL_REST_INTERVAL ) * factor;
+				float	flMaxRestInterval	= MIN_MAX_PISTOL_REST_INTERVAL + ( MAX_MAX_PISTOL_REST_INTERVAL - MIN_MAX_PISTOL_REST_INTERVAL ) * factor;
+				
+				GetShotRegulator()->SetRestInterval( flMinRestInterval, flMaxRestInterval );
+				GetShotRegulator()->SetBurstShotCountRange( nMinBurst, nMaxBurst );
+			}
+			else
+			{
+				GetShotRegulator()->SetBurstShotCountRange(GetActiveWeapon()->GetMinBurst(), GetActiveWeapon()->GetMaxBurst() );
+				GetShotRegulator()->SetRestInterval( 0.6, 1.4 );
+			}
+		}
+
+		// Add some noise into the pistol
+		GetShotRegulator()->SetBurstInterval( 0.2f, 0.5f );
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SetBurstMode( bool bEnable )
+{
+	int nOldBurstMode = m_nBurstMode;
+	m_nBurstSteerMode = BURST_STEER_NONE;
+	m_flBurstPredictTime = gpGlobals->curtime - 1.0f;
+	if ( GetActiveWeapon() )
+	{
+		m_nBurstMode = bEnable ? BURST_ACTIVE : BURST_NOT_ACTIVE;
+		if ( bEnable )
+		{
+			m_nBurstHits = 0;
+		}
+	}
+	else
+	{
+		m_nBurstMode = BURST_NOT_ACTIVE;
+	}
+
+	if ( m_nBurstMode != nOldBurstMode )
+	{
+		OnUpdateShotRegulator();
+		if ( m_nBurstMode == BURST_NOT_ACTIVE )
+		{
+			// Check for inconsistency...
+			int nMinBurstCount, nMaxBurstCount;
+			GetShotRegulator()->GetBurstShotCountRange( &nMinBurstCount, &nMaxBurstCount );
+			if ( GetShotRegulator()->GetBurstShotsRemaining() > nMaxBurstCount )
+			{
+				GetShotRegulator()->SetBurstShotsRemaining( nMaxBurstCount );
+			}
+		}
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Should we attempt to stitch?
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::ShouldAttemptToStitch()
+{
+	if ( IsEnemyInAnAirboat() )
+		return true;
+
+	if ( !GetShootTarget() )
+		return false;
+
+	if ( HasSpawnFlags( SF_METROPOLICE_ALWAYS_STITCH ) )
+	{
+		// Don't stitch if the player is at the same level or higher
+		if ( GetEnemy()->GetAbsOrigin().z - GetAbsOrigin().z > -36 )
+			return false;
+
+		return true;
+	}
+
+	return false;
+}
+
+
+//-----------------------------------------------------------------------------
+// position to shoot at
+//-----------------------------------------------------------------------------
+Vector CNPC_MetroPolice::StitchAimTarget( const Vector &posSrc, bool bNoisy ) 
+{
+#ifdef MAPBASE
+	if ( !GetEnemy() )
+		return vec3_origin;
+#endif
+
+	// This will make us aim a stitch at the feet of the player so we can see it
+	if ( !GetEnemy()->IsPlayer() )
+		return GetShootTarget()->BodyTarget( posSrc, bNoisy );
+
+	if ( !IsEnemyInAnAirboat() )
+	{
+		Vector vecBodyTarget;
+		if ( ( GetEnemy()->GetWaterLevel() == 0 ) && ( GetEnemy()->GetFlags() & FL_ONGROUND ) )
+		{
+			GetEnemy()->CollisionProp()->NormalizedToWorldSpace( Vector( 0.5f, 0.5f, 0.08f ), &vecBodyTarget );
+			return vecBodyTarget;
+		}
+
+		// Underwater? Just use the normal thing
+		if ( GetEnemy()->GetWaterLevel() == 3 )
+			return GetShootTarget()->BodyTarget( posSrc, bNoisy );
+
+		// Trace down...
+		trace_t	trace;
+		GetEnemy()->CollisionProp()->NormalizedToWorldSpace( Vector( 0.5f, 0.5f, 1.0f ), &vecBodyTarget );
+		float flHeight = GetEnemy()->WorldAlignSize().z;
+		UTIL_TraceLine( vecBodyTarget, vecBodyTarget + Vector( 0, 0, -flHeight -80 ), 
+			(MASK_SOLID_BRUSHONLY | MASK_WATER), NULL, COLLISION_GROUP_NONE, &trace );
+		return trace.endpos;
+	}
+
+	// NOTE: HACK! Ths 0.08 is where the water level happens to be.
+	// We probably want to find the exact water level and use that as the z position.
+	Vector vecBodyTarget;
+	if ( !bNoisy )
+	{
+		GetShootTarget()->CollisionProp()->NormalizedToWorldSpace( Vector( 0.5f, 0.5f, 0.08f ), &vecBodyTarget );
+	}
+	else
+	{
+		GetShootTarget()->CollisionProp()->RandomPointInBounds( Vector( 0.25f, 0.25f, 0.08f ), Vector( 0.75f, 0.75f, 0.08f ), &vecBodyTarget );
+	}
+
+	return vecBodyTarget;
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AimBurstRandomly( int nMinCount, int nMaxCount, float flMinDelay, float flMaxDelay )
+{
+	if ( !IsCurrentlyFiringBurst() )
+		return;
+
+	GetShotRegulator()->SetParameters( nMinCount, nMaxCount, flMinDelay, flMaxDelay );
+	GetShotRegulator()->Reset( true );
+
+	int nShotCount = GetShotRegulator()->GetBurstShotsRemaining();
+
+	Vector vecDelta = StitchAimTarget( GetAbsOrigin(), true ) - Weapon_ShootPosition();
+	VectorNormalize( vecDelta );
+
+	// Choose a random direction vector perpendicular to the delta position
+	Vector vecRight, vecUp;
+	VectorVectors( vecDelta, vecRight, vecUp );
+	float flAngle = random->RandomFloat( 0.0f, 2 * M_PI );
+	VectorMultiply( vecRight, cos(flAngle), m_vecBurstDelta );
+	VectorMA( m_vecBurstDelta, sin(flAngle), vecUp, m_vecBurstDelta );
+
+	// The size of this determines the cone angle
+	m_vecBurstDelta *= 0.4f;
+
+	VectorMA( vecDelta, -0.5f, m_vecBurstDelta, m_vecBurstTargetPos );
+	m_vecBurstTargetPos += Weapon_ShootPosition();
+
+	m_vecBurstDelta /= (nShotCount - 1);
+}
+
+
+//-----------------------------------------------------------------------------
+// Choose a random vector somewhere between the two specified vectors
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::RandomDirectionBetweenVectors( const Vector &vecStart, const Vector &vecEnd, Vector *pResult )
+{
+	Assert( fabs( vecStart.Length() - 1.0f ) < 1e-3 );
+	Assert( fabs( vecEnd.Length() - 1.0f ) < 1e-3 );
+
+	float flCosAngle = DotProduct( vecStart, vecEnd );
+	if ( fabs( flCosAngle - 1.0f ) < 1e-3 )
+	{
+		*pResult = vecStart;
+		return;
+	}
+
+	Vector vecNormal;
+	CrossProduct( vecStart, vecEnd, vecNormal );
+	float flLength = VectorNormalize( vecNormal );
+	if ( flLength < 1e-3 )
+	{
+		// This is wrong for anti-parallel vectors. so what?
+		*pResult = vecStart;
+		return;
+	}
+
+	// Rotate the starting angle the specified amount
+	float flAngle = acos(flCosAngle) * random->RandomFloat( 0.0f, 1.0f );
+	VMatrix rotationMatrix;
+	MatrixBuildRotationAboutAxis( rotationMatrix, vecNormal, flAngle );
+	Vector3DMultiply( rotationMatrix, vecStart, *pResult );
+}
+
+
+//-----------------------------------------------------------------------------
+// Compute a predicted shoot target position n seconds into the future
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::PredictShootTargetPosition( float flDeltaTime, float flMinLeadDist, float flAddVelocity, Vector *pVecTarget, Vector *pVecTargetVelocity )
+{
+	CBaseEntity *pShootTarget = GetShootTarget();
+	*pVecTarget = StitchAimTarget( GetAbsOrigin(), true );
+
+	Vector vecSmoothedVel = pShootTarget->GetSmoothedVelocity();
+
+	// When we're in the air, don't predict vertical motion
+	if( (pShootTarget->GetFlags() & FL_ONGROUND) == 0 )
+	{
+		vecSmoothedVel.z = 0.0f;
+	}
+
+	Vector vecVelocity;
+	AngularImpulse angImpulse;
+	GetShootTarget()->GetVelocity( &vecVelocity, &angImpulse );
+
+	Vector vecLeadVector;
+	VMatrix rotationMatrix;
+	float flAngVel = VectorNormalize( angImpulse );
+	flAngVel -= 30.0f;
+	if ( flAngVel > 0.0f )
+	{
+		MatrixBuildRotationAboutAxis( rotationMatrix, angImpulse, flAngVel * flDeltaTime * 0.333f );
+		Vector3DMultiply( rotationMatrix, vecSmoothedVel, vecLeadVector );
+	}
+	else
+	{
+		vecLeadVector = vecSmoothedVel;
+	}
+
+	if ( flAddVelocity != 0.0f )
+	{
+		Vector vecForward;
+		pShootTarget->GetVectors( &vecForward, NULL, NULL );
+		VectorMA( vecLeadVector, flAddVelocity, vecForward,	vecLeadVector );
+	}
+
+	*pVecTargetVelocity = vecLeadVector;
+	
+	if ( (vecLeadVector.LengthSqr() * flDeltaTime * flDeltaTime) < flMinLeadDist * flMinLeadDist )
+	{
+		VectorNormalize( vecLeadVector );
+		vecLeadVector *= flMinLeadDist;
+	}
+	else
+	{
+		vecLeadVector *= flDeltaTime;
+	}
+
+	*pVecTarget += vecLeadVector;
+}
+
+
+//-----------------------------------------------------------------------------
+// Compute a predicted velocity n seconds into the future (given a known acceleration rate)
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::PredictShootTargetVelocity( float flDeltaTime, Vector *pVecTargetVel )
+{
+	*pVecTargetVel = GetShootTarget()->GetSmoothedVelocity();
+
+	// Unless there's a big angular velocity, we can assume he accelerates
+	// along the forward direction. Predict acceleration for
+	Vector vecForward;
+	GetShootTarget()->GetVectors( &vecForward, NULL, NULL );
+
+//	float flBlendFactor = 1.0f;
+//	VectorMA( *pVecTargetVel, flBlendFactor * VEHICLE_PREDICT_ACCELERATION, vecForward, *pVecTargetVel );
+//	if ( pVecTargetVel->LengthSqr() > (VEHICLE_PREDICT_MAX_SPEED * VEHICLE_PREDICT_MAX_SPEED) )
+//	{
+//		VectorNormalize( *pVecTargetVel );
+//		*pVecTargetVel *= VEHICLE_PREDICT_MAX_SPEED;
+//	}
+}
+
+
+//-----------------------------------------------------------------------------
+// How many shots will I fire in a particular amount of time?
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::CountShotsInTime( float flDeltaTime ) const
+{
+	return (int)(flDeltaTime / GetActiveWeapon()->GetFireRate() + 0.5f);
+}
+
+float CNPC_MetroPolice::GetTimeForShots( int nShotCount ) const
+{
+	return nShotCount * GetActiveWeapon()->GetFireRate();
+}
+
+
+//-----------------------------------------------------------------------------
+// Visualize stitch
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::VisualizeStitch( const Vector &vecStart, const Vector &vecEnd )
+{
+	NDebugOverlay::Cross3D( vecStart, -Vector(32,32,32), Vector(32,32,32), 255, 0, 0, false, 5.0f );
+	NDebugOverlay::Cross3D( vecEnd, -Vector(32,32,32), Vector(32,32,32), 0, 255, 0, false, 5.0f );
+	NDebugOverlay::Line( vecStart, vecEnd, 0, 255, 0, true, 5.0f );
+}
+
+
+//-----------------------------------------------------------------------------
+// Visualize line of death
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::VisualizeLineOfDeath( )
+{
+	Vector vecAcross, vecStart;
+	CrossProduct( m_vecBurstLineOfDeathDelta, Vector( 0, 0, 1 ), vecAcross );
+	VectorNormalize( vecAcross );
+	NDebugOverlay::Line( m_vecBurstLineOfDeathOrigin, m_vecBurstLineOfDeathOrigin + m_vecBurstLineOfDeathDelta, 255, 255, 0, false, 5.0f );
+	VectorMA( m_vecBurstLineOfDeathOrigin, m_flBurstSteerDistance, vecAcross, vecStart );
+	NDebugOverlay::Line( vecStart, vecStart + m_vecBurstLineOfDeathDelta, 255, 0, 0, false, 5.0f );
+	VectorMA( m_vecBurstLineOfDeathOrigin, -m_flBurstSteerDistance, vecAcross, vecStart );
+	NDebugOverlay::Line( vecStart, vecStart + m_vecBurstLineOfDeathDelta, 255, 0, 0, false, 5.0f );
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+#define AIM_AT_NEAR_DISTANCE_MIN		400.0f
+#define AIM_AT_NEAR_DISTANCE_MAX		1000.0f
+#define AIM_AT_NEAR_DISTANCE_DELTA		(AIM_AT_NEAR_DISTANCE_MAX - AIM_AT_NEAR_DISTANCE_MIN)
+#define AIM_AT_NEAR_DISTANCE_BONUS  	-200.0f
+
+#define AIM_AT_FAR_DISTANCE_MIN			2000.0f
+#define AIM_AT_FAR_DISTANCE_BONUS_DISTANCE	500.0f
+#define AIM_AT_FAR_DISTANCE_BONUS  		200.0f	// Add this much bonus after each BONUS_DISTANCE
+
+
+//-----------------------------------------------------------------------------
+// Modify the stitch length
+//-----------------------------------------------------------------------------
+float CNPC_MetroPolice::ComputeDistanceStitchModifier( float flDistanceToTarget ) const
+{
+	if ( flDistanceToTarget < AIM_AT_NEAR_DISTANCE_MIN )
+	{
+		return AIM_AT_NEAR_DISTANCE_BONUS;
+	}
+
+	if ( flDistanceToTarget < AIM_AT_NEAR_DISTANCE_MAX )
+	{
+		float flFraction = 1.0f - ((flDistanceToTarget - AIM_AT_NEAR_DISTANCE_MIN) / AIM_AT_NEAR_DISTANCE_DELTA);
+		return flFraction * AIM_AT_NEAR_DISTANCE_BONUS;
+	}
+
+	if ( flDistanceToTarget > AIM_AT_FAR_DISTANCE_MIN )
+	{
+		float flFactor = (flDistanceToTarget - AIM_AT_FAR_DISTANCE_MIN) / AIM_AT_FAR_DISTANCE_BONUS_DISTANCE;
+		return flFactor * AIM_AT_FAR_DISTANCE_BONUS;
+	}
+
+	return 0.0f;
+}
+
+
+//-----------------------------------------------------------------------------
+// Set up the shot regulator
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SetupBurstShotRegulator( float flReactionTime )
+{
+	// We want a certain amount of reaction time before the shots hit the boat
+	int nDesiredShotCount = CountShotsInTime( flReactionTime );
+	GetShotRegulator()->SetBurstShotCountRange( nDesiredShotCount, nDesiredShotCount );
+	GetShotRegulator()->SetRestInterval( 0.7f, 0.9f );
+	GetShotRegulator()->Reset( true );
+	int nShots = GetShotRegulator()->GetBurstShotsRemaining();
+	OnRangeAttack1();
+	return nShots;
+}
+
+
+//-----------------------------------------------------------------------------
+// Shoots a burst right at the player
+//-----------------------------------------------------------------------------
+#define TIGHT_GROUP_MIN_DIST 750.0f
+#define TIGHT_GROUP_MIN_SPEED 400.0f
+
+void CNPC_MetroPolice::AimBurstTightGrouping( float flShotTime )
+{
+	if ( !IsCurrentlyFiringBurst() )
+		return;
+
+	// We want a certain amount of reaction time before the shots hit the boat
+	SetupBurstShotRegulator( flShotTime );
+
+	// Max number of times we can hit the enemy.
+	// Can hit more if we're slow + close
+	float flDistToTargetSqr = GetShootTarget()->WorldSpaceCenter().DistToSqr( Weapon_ShootPosition() );
+
+	int nHitCount = sk_metropolice_stitch_tight_hitcount.GetInt();
+
+	Vector vecTargetVel;
+	GetShootTarget()->GetVelocity( &vecTargetVel, NULL );
+	if (( flDistToTargetSqr > TIGHT_GROUP_MIN_DIST*TIGHT_GROUP_MIN_DIST ) || 
+		( vecTargetVel.LengthSqr() > TIGHT_GROUP_MIN_SPEED * TIGHT_GROUP_MIN_SPEED ))
+	{
+		m_nMaxBurstHits = random->RandomInt( nHitCount, nHitCount + 1 );
+	}
+	else
+	{
+		m_nMaxBurstHits = random->RandomInt( 2 * nHitCount - 1, 2 * nHitCount + 1 );
+	}
+
+	m_nBurstMode = BURST_TIGHT_GROUPING;
+
+	// This helps the NPC model aim at the correct point
+	m_nBurstSteerMode = BURST_STEER_EXACTLY_TOWARD_TARGET;
+	m_vecBurstTargetPos = GetEnemy()->WorldSpaceCenter();
+}
+
+
+//-----------------------------------------------------------------------------
+// Reaction time for stitch
+//-----------------------------------------------------------------------------
+#define AIM_AT_TIME_DELTA_SPEED 100.0f
+#define AIM_AT_TIME_DELTA_DIST 500.0f
+#define AIM_AT_TIME_SPEED_COUNT 6
+#define AIM_AT_TIME_DIST_COUNT 7
+
+static float s_pReactionFraction[AIM_AT_TIME_DIST_COUNT][AIM_AT_TIME_SPEED_COUNT] =
+{
+	{  0.5f, 0.5f,  0.5f,  0.5f,  0.5f, 1.0f },
+	{  0.5f, 0.5f,  0.5f,  0.5f, 0.75f, 1.0f },
+	{  0.5f, 0.5f,  0.5f, 0.65f,  0.8f, 1.0f },
+	{  0.5f, 0.5f,  0.5f, 0.75f,  1.0f, 1.0f },
+	{  0.5f, 0.5f, 0.75f,  1.0f,  1.0f, 1.0f },
+	{ 0.75f, 1.0f,  1.0f,  1.0f,  1.0f, 1.0f },
+	{  1.0f, 1.0f,  1.0f,  1.0f,  1.0f, 1.0f },
+};
+
+float CNPC_MetroPolice::AimBurstAtReactionTime( float flReactionTime, float flDistToTarget, float flCurrentSpeed )
+{
+	flReactionTime *= sk_metropolice_stitch_reaction.GetFloat();
+
+	if ( IsEnemyInAnAirboat() )
+	{
+		float u = flCurrentSpeed / AIM_AT_TIME_DELTA_SPEED;
+		float v = flDistToTarget / AIM_AT_TIME_DELTA_DIST;
+		int nu = (int)u;
+		int nv = (int)v;
+		if (( nu < AIM_AT_TIME_SPEED_COUNT - 1 ) && ( nv < AIM_AT_TIME_DIST_COUNT - 1 ))
+		{
+			float fu = u - nu;
+			float fv = v - nv;
+			float flReactionFactor = s_pReactionFraction[nv][nu] * (1.0f - fu) * (1.0f - fv);
+			flReactionFactor += s_pReactionFraction[nv+1][nu] * (1.0f - fu) * fv;
+			flReactionFactor += s_pReactionFraction[nv][nu+1] * fu * (1.0f - fv);
+			flReactionFactor += s_pReactionFraction[nv+1][nu+1] * fu * fv;
+
+			flReactionTime *= flReactionFactor;
+		}
+	}
+	
+	return flReactionTime;
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+#define AIM_AT_SHOT_DELTA_SPEED 100.0f
+#define AIM_AT_SHOT_DELTA_DIST 500.0f
+#define AIM_AT_SHOT_SPEED_COUNT 6
+#define AIM_AT_SHOT_DIST_COUNT 6
+
+static int s_pShotCountFraction[AIM_AT_TIME_DIST_COUNT][AIM_AT_TIME_SPEED_COUNT] =
+{
+	{  3.0f, 3.0f,  2.5f,  1.5f,  1.0f, 0.0f },
+	{  3.0f, 3.0f,  2.5f,  1.25f, 0.5f, 0.0f },
+	{  2.5f, 2.5f,  2.0f,  1.0f,  0.0f, 0.0f },
+	{  2.0f, 2.0f,  1.5f,  0.5f,  0.0f, 0.0f },
+	{  1.0f, 1.0f,  1.0f,  0.5f,  0.0f, 0.0f },
+	{  0.0f, 0.0f,  0.0f,  0.0f,  0.0f, 0.0f },
+};
+
+int CNPC_MetroPolice::AimBurstAtSetupHitCount( float flDistToTarget, float flCurrentSpeed )
+{
+	// Max number of times we can hit the enemy
+	int nHitCount = sk_metropolice_stitch_at_hitcount.GetInt();
+	m_nMaxBurstHits = random->RandomInt( nHitCount, nHitCount + 1 );
+
+	if ( IsEnemyInAnAirboat() )
+	{
+		float u = flCurrentSpeed / AIM_AT_SHOT_DELTA_SPEED;
+		float v = flDistToTarget / AIM_AT_SHOT_DELTA_DIST;
+		int nu = (int)u;
+		int nv = (int)v;
+		if (( nu < AIM_AT_SHOT_SPEED_COUNT - 1 ) && ( nv < AIM_AT_SHOT_DIST_COUNT - 1 ))
+		{
+			float fu = u - nu;
+			float fv = v - nv;
+			float flShotFactor = s_pShotCountFraction[nv][nu] * (1.0f - fu) * (1.0f - fv);
+			flShotFactor += s_pShotCountFraction[nv+1][nu] * (1.0f - fu) * fv;
+			flShotFactor += s_pShotCountFraction[nv][nu+1] * fu * (1.0f - fv);
+			flShotFactor += s_pShotCountFraction[nv+1][nu+1] * fu * fv;
+
+			int nExtraShots = nHitCount * flShotFactor;
+			m_nMaxBurstHits += random->RandomInt( nExtraShots, nExtraShots + 1 );
+			return nExtraShots;
+		}
+	}
+
+	return 0;
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+#define AIM_AT_DEFAULT_STITCH_SHOT_DIST	40.0f
+#define AIM_AT_SPEED_BONUS				200.0f
+#define AIM_AT_REACTION_TIME_FRACTION	0.8f
+#define AIM_AT_NEAR_REACTION_TIME_FRACTION	0.3f
+#define AIM_AT_STEER_DISTANCE			125.0f
+
+void CNPC_MetroPolice::AimBurstAtEnemy( float flReactionTime )
+{
+	if ( !IsCurrentlyFiringBurst() )
+		return;
+
+	Vector vecVelocity;
+	GetShootTarget()->GetVelocity( &vecVelocity, NULL );
+	float flCurrentSpeed = vecVelocity.Length();
+	float flDistToTargetSqr = GetShootTarget()->WorldSpaceCenter().AsVector2D().DistToSqr( Weapon_ShootPosition().AsVector2D() );
+	float flDistToTarget = sqrt(flDistToTargetSqr);
+
+	flReactionTime = AimBurstAtReactionTime( flReactionTime, flDistToTarget, flCurrentSpeed );
+
+	// We want a certain amount of reaction time before the shots hit the boat
+	int nShotCount = SetupBurstShotRegulator( flReactionTime );
+
+	bool bIsInVehicle = IsEnemyInAnAirboat();
+	if ( bIsInVehicle )
+	{
+		m_nBurstMode = BURST_LOCK_ON_AFTER_HIT;
+		m_flBurstSteerDistance = AIM_AT_STEER_DISTANCE;
+	}
+	else
+	{
+		m_nBurstMode = BURST_ACTIVE;
+		m_flBurstSteerDistance = 0;
+	}
+	m_nBurstSteerMode = BURST_STEER_WITHIN_LINE_OF_DEATH;
+
+	// Max number of times we can hit the enemy
+	int nExtraShots = AimBurstAtSetupHitCount( flDistToTarget, flCurrentSpeed );
+	float flExtraTime = GetTimeForShots( nExtraShots ) + (1.0f - AIM_AT_REACTION_TIME_FRACTION) * flReactionTime;
+	float flReactionFraction = 1.0f - flExtraTime / flReactionTime;
+	if ( flReactionFraction < 0.5f )
+	{
+		flReactionFraction = 0.5f;
+	}
+
+	float flFirstHitTime = flReactionTime * flReactionFraction;
+	Vector vecShootAt, vecShootAtVel;
+	PredictShootTargetPosition( flFirstHitTime, 0.0f, 0.0f, &vecShootAt, &vecShootAtVel );
+
+	Vector vecDelta;
+	VectorSubtract( vecShootAt, Weapon_ShootPosition(), vecDelta );
+	float flDistanceToTarget = vecDelta.Length();
+
+	// Always stitch horizontally...
+	vecDelta.z = 0.0f;
+
+	// The max stitch distance here is used to guarantee the cop doesn't try to lead
+	// the airboat so much that he ends up shooting behind himself
+	float flMaxStitchDistance = VectorNormalize( vecDelta );
+	flMaxStitchDistance -= 50.0f;
+	if ( flMaxStitchDistance < 0 )
+	{
+		flMaxStitchDistance = 0.0f;
+	}
+
+	float flStitchLength = nShotCount * AIM_AT_DEFAULT_STITCH_SHOT_DIST;
+
+	// Modify the stitch length based on distance from the shooter
+	flStitchLength += ComputeDistanceStitchModifier( flDistanceToTarget );
+
+	if ( bIsInVehicle )
+	{
+		// Make longer stitches if the enemy is going faster
+		Vector vecEnemyVelocity = GetShootTarget()->GetSmoothedVelocity();
+		if( (GetShootTarget()->GetFlags() & FL_ONGROUND) == 0 )
+		{
+			vecEnemyVelocity.z = 0.0f;
+		}
+
+		float flEnemySpeed = VectorNormalize( vecEnemyVelocity );
+		flStitchLength += AIM_AT_SPEED_BONUS * ( flEnemySpeed / 100.0f );
+
+		// Add in a little randomness across the direction of motion...
+		// Always put it on the side we're currently looking at
+		Vector vecAcross;
+		CrossProduct( vecEnemyVelocity, Vector( 0, 0, 1 ), vecAcross );
+		VectorNormalize( vecAcross );
+		
+		Vector eyeForward;
+		AngleVectors( GetEnemy()->EyeAngles(), &eyeForward );
+		if ( DotProduct( vecAcross, eyeForward ) < 0.0f )
+		{
+			vecAcross *= -1.0f;
+		}
+
+		float flMinAdd = RemapVal( flEnemySpeed, 0.0f, 200.0f, 70.0f, 30.0f );
+		VectorMA( vecShootAt, random->RandomFloat( flMinAdd, 100.0f ), vecAcross, vecShootAt );
+	}
+
+	// Compute the distance along the stitch direction to the cop. we don't want to cross that line
+	Vector vecStitchStart, vecStitchEnd;
+	VectorMA( vecShootAt, -MIN( flStitchLength * flReactionFraction, flMaxStitchDistance ), vecDelta, vecStitchStart );
+	VectorMA( vecShootAt, flStitchLength * (1.0f - flReactionFraction), vecDelta, vecStitchEnd );
+	
+	// Trace down a bit to hit the ground if we're above the ground...
+	trace_t	trace;
+	UTIL_TraceLine( vecStitchStart, vecStitchStart + Vector( 0, 0, -512 ), (MASK_SOLID_BRUSHONLY | MASK_WATER), NULL, COLLISION_GROUP_NONE, &trace );
+	m_vecBurstTargetPos = trace.endpos;
+	VectorSubtract( vecStitchEnd, m_vecBurstTargetPos, m_vecBurstDelta );
+
+	m_vecBurstLineOfDeathOrigin = m_vecBurstTargetPos;
+	m_vecBurstLineOfDeathDelta = m_vecBurstDelta;
+
+	m_vecBurstDelta /= (nShotCount - 1);
+
+//	VisualizeStitch( m_vecBurstTargetPos, vecStitchEnd );
+//	VisualizeLineOfDeath();
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+#define AIM_IN_FRONT_OF_DEFAULT_STITCH_LENGTH		1000.0f
+#define AIM_IN_FRONT_OF_MINIMUM_DISTANCE			500.0f
+#define AIM_IN_FRONT_DRAW_LINE_OF_DEATH_FRACTION	0.5f
+#define AIM_IN_FRONT_STEER_DISTANCE					150.0f
+#define AIM_IN_FRONT_REACTION_FRACTION				0.8f
+#define AIM_IN_FRONT_EXTRA_VEL						200.0f
+
+void CNPC_MetroPolice::AimBurstInFrontOfEnemy( float flReactionTime )
+{
+	if ( !IsCurrentlyFiringBurst() )
+		return;
+
+	flReactionTime *= sk_metropolice_stitch_reaction.GetFloat();
+
+	// We want a certain amount of reaction time before the shots hit the boat
+	int nShotCount = SetupBurstShotRegulator( flReactionTime );
+
+	// Max number of times we can hit the player in the airboat
+	m_nMaxBurstHits = random->RandomInt( 3, 4 );
+	m_nBurstMode = BURST_LOCK_ON_AFTER_HIT;
+	m_nBurstSteerMode = BURST_STEER_WITHIN_LINE_OF_DEATH;
+
+	// The goal here is to slow him down. Choose a target position such that we predict
+	// where he'd be in he accelerated by N over the reaction time. Prevent him from getting there.
+	Vector vecShootAt, vecShootAtVel, vecAcross;
+	PredictShootTargetPosition( flReactionTime * AIM_IN_FRONT_REACTION_FRACTION, 
+		AIM_IN_FRONT_OF_MINIMUM_DISTANCE, 0.0f, &vecShootAt, &vecShootAtVel );
+
+	// Now add in some extra vel in a random direction + try to prevent that....
+	Vector vecTargetToGun, vecExtraDistance;
+	VectorSubtract( Weapon_ShootPosition(), vecShootAt, vecTargetToGun );
+	VectorNormalize( vecTargetToGun );
+	VectorNormalize( vecShootAtVel );
+	RandomDirectionBetweenVectors( vecShootAtVel, vecTargetToGun, &vecExtraDistance );
+	vecExtraDistance *= AIM_IN_FRONT_EXTRA_VEL;
+	vecShootAt += vecExtraDistance;
+
+	CrossProduct( vecExtraDistance, Vector( 0, 0, 1 ), vecAcross );
+	VectorNormalize( vecAcross );
+
+	float flStitchLength = AIM_IN_FRONT_OF_DEFAULT_STITCH_LENGTH;
+
+	Vector vecEndPoint1, vecEndPoint2;
+	VectorSubtract( Weapon_ShootPosition(), StitchAimTarget( GetAbsOrigin(), false ), vecTargetToGun );
+	float flSign = ( DotProduct( vecAcross, vecTargetToGun ) >= 0.0f ) ? 1.0f : -1.0f;
+	VectorMA( vecShootAt, flSign * flStitchLength * AIM_IN_FRONT_REACTION_FRACTION, vecAcross, vecEndPoint1 );
+	VectorMA( vecShootAt, -flSign * flStitchLength * (1.0f - AIM_IN_FRONT_REACTION_FRACTION), vecAcross, vecEndPoint2 );
+
+	m_vecBurstTargetPos = vecEndPoint1;
+	VectorSubtract( vecEndPoint2, vecEndPoint1, m_vecBurstDelta );
+
+	// This defines the line of death, which, when crossed, results in damage
+	m_vecBurstLineOfDeathOrigin = m_vecBurstTargetPos;
+	m_vecBurstLineOfDeathDelta = m_vecBurstDelta;
+	m_flBurstSteerDistance = AIM_IN_FRONT_STEER_DISTANCE;
+
+	// Make the visual representation of the line of death lie closest to the boat.
+	VectorMA( m_vecBurstTargetPos, -AIM_IN_FRONT_STEER_DISTANCE, vecShootAtVel, m_vecBurstTargetPos );
+	m_vecBurstDelta /= (nShotCount - 1);
+
+//	VisualizeStitch( m_vecBurstTargetPos, m_vecBurstTargetPos + m_vecBurstDelta * (nShotCount - 1) );
+//	VisualizeLineOfDeath();
+}
+
+
+//-----------------------------------------------------------------------------
+// Aim burst behind enemy
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AimBurstBehindEnemy( float flShotTime )
+{
+	if ( !IsCurrentlyFiringBurst() )
+		return;
+
+	flShotTime *= sk_metropolice_stitch_reaction.GetFloat();
+
+	// We want a certain amount of reaction time before the shots hit the boat
+	int nShotCount = SetupBurstShotRegulator( flShotTime );
+
+	// Max number of times we can hit the player in the airboat
+	int nHitCount = sk_metropolice_stitch_behind_hitcount.GetInt();
+	m_nMaxBurstHits = random->RandomInt( nHitCount, nHitCount + 1 );
+	m_nBurstMode = BURST_LOCK_ON_AFTER_HIT;
+	m_nBurstSteerMode = BURST_STEER_WITHIN_LINE_OF_DEATH;
+
+	// Shoot across the enemy in between the enemy and me
+	Vector vecShootAt, vecShootAtVel, vecAcross;
+	PredictShootTargetPosition( 0.0f, 0.0f, 0.0f, &vecShootAt, &vecShootAtVel );
+
+	// Choose a point in between the shooter + the target
+	Vector vecDelta;
+	VectorSubtract( Weapon_ShootPosition(), vecShootAt, vecDelta );
+	vecDelta.z = 0.0f;
+	float flDistTo = VectorNormalize( vecDelta );
+	if ( flDistTo > AIM_BEHIND_MINIMUM_DISTANCE )
+	{
+		flDistTo = AIM_BEHIND_MINIMUM_DISTANCE;
+	}
+	VectorMA( vecShootAt, flDistTo, vecDelta, vecShootAt );
+	CrossProduct( vecDelta, Vector( 0, 0, 1 ), vecAcross );
+
+	float flStitchLength = AIM_BEHIND_DEFAULT_STITCH_LENGTH;
+
+	Vector vecEndPoint1, vecEndPoint2;
+	VectorMA( vecShootAt, -flStitchLength * 0.5f, vecAcross, vecEndPoint1 );
+	VectorMA( vecShootAt, flStitchLength * 0.5f, vecAcross, vecEndPoint2 );
+	
+	m_vecBurstTargetPos = vecEndPoint1;
+	VectorSubtract( vecEndPoint2, vecEndPoint1, m_vecBurstDelta );
+
+	// This defines the line of death, which, when crossed, results in damage
+	m_vecBurstLineOfDeathOrigin = m_vecBurstTargetPos;
+	m_vecBurstLineOfDeathDelta = m_vecBurstDelta;
+	m_flBurstSteerDistance = AIM_BEHIND_STEER_DISTANCE;
+
+	// Make the visual representation of the line of death lie closest to the boat.
+	VectorMA( m_vecBurstTargetPos, -AIM_BEHIND_STEER_DISTANCE, vecDelta, m_vecBurstTargetPos );
+	m_vecBurstDelta /= (nShotCount - 1);
+
+//	VisualizeStitch( m_vecBurstTargetPos, m_vecBurstTargetPos + m_vecBurstDelta * (nShotCount - 1) );
+//	VisualizeLineOfDeath();
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AimBurstAlongSideOfEnemy( float flFollowTime )
+{
+	if ( !IsCurrentlyFiringBurst() )
+		return;
+
+	flFollowTime *= sk_metropolice_stitch_reaction.GetFloat();
+
+	// We want a certain amount of reaction time before the shots hit the boat
+	int nShotCount = SetupBurstShotRegulator( flFollowTime );
+
+	// Max number of times we can hit the player in the airboat
+	int nHitCount = sk_metropolice_stitch_along_hitcount.GetInt();
+	m_nMaxBurstHits = random->RandomInt( nHitCount, nHitCount + 1 );
+	m_nBurstMode = BURST_LOCK_ON_AFTER_HIT;
+	m_nBurstSteerMode = BURST_STEER_WITHIN_LINE_OF_DEATH;
+
+	Vector vecShootAt, vecShootAtVel, vecAcross;
+	PredictShootTargetPosition( AIM_ALONG_SIDE_LINE_OF_DEATH_LEAD_TIME, 225.0f, 0.0f, &vecShootAt, &vecShootAtVel );
+	CrossProduct( vecShootAtVel, Vector( 0, 0, 1 ), vecAcross );
+	VectorNormalize( vecAcross );
+
+	// Choose the side of the vehicle which is closer to the shooter
+	Vector vecSidePoint;		
+	Vector vecTargetToGun;
+	VectorSubtract( Weapon_ShootPosition(), vecShootAt, vecTargetToGun );
+	float flSign = ( DotProduct( vecTargetToGun, vecAcross ) > 0.0f ) ? 1.0f : -1.0f;
+	float flDist = AIM_ALONG_SIDE_LINE_OF_DEATH_DISTANCE + random->RandomFloat( 0.0f, 50.0f );
+	VectorMA( vecShootAt, flSign * flDist, vecAcross, vecSidePoint );
+
+	vecShootAtVel.z = 0.0f;
+	float flTargetSpeed = VectorNormalize( vecShootAtVel );
+	float flStitchLength = MAX( AIM_IN_FRONT_OF_DEFAULT_STITCH_LENGTH, flTargetSpeed * flFollowTime * 0.9 );
+
+	// This defines the line of death, which, when crossed, results in damage
+	m_vecBurstLineOfDeathOrigin = vecSidePoint;
+	VectorMultiply( vecShootAtVel, flStitchLength, m_vecBurstLineOfDeathDelta );
+
+	// Pull the endpoint a little toward the NPC firing it...
+	float flExtraDist = random->RandomFloat( 25.0f, 50.0f );
+	VectorNormalize( vecTargetToGun );
+	if ( flSign * DotProduct( vecTargetToGun, vecShootAtVel ) < 0.1f )
+	{
+		flExtraDist += 100.0f;
+	}
+	VectorMA( m_vecBurstLineOfDeathDelta, flSign * flExtraDist, vecAcross, m_vecBurstLineOfDeathDelta );
+
+	m_flBurstSteerDistance = AIM_ALONG_SIDE_STEER_DISTANCE;
+	m_vecBurstDelta = m_vecBurstLineOfDeathDelta;
+	m_vecBurstTargetPos = m_vecBurstLineOfDeathOrigin;
+
+	// Make the visual representation of the line of death lie closest to the boat.
+	VectorMA( m_vecBurstTargetPos, -flSign * AIM_ALONG_SIDE_STEER_DISTANCE, vecAcross, m_vecBurstTargetPos );
+	m_vecBurstDelta /= (nShotCount - 1);
+
+//	VisualizeStitch( m_vecBurstTargetPos, m_vecBurstTargetPos + m_vecBurstDelta * (nShotCount - 1) );
+//	VisualizeLineOfDeath();
+}
+
+
+//-----------------------------------------------------------------------------
+// Different burst steering modes
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SteerBurstTowardTargetUseSpeedOnly( const Vector &vecShootAt, 
+	const Vector &vecShootAtVelocity, float flPredictTime, int nShotsTillPredict )
+{
+	// Only account for changes in *speed*; ignore all changes in velocity direction, etc.
+	// This one only hits the player if there is *no* steering, just acceleration or decceleration
+	Vector vecBurstDir = m_vecBurstPredictedVelocityDir;
+	float flActualSpeed = DotProduct( vecShootAtVelocity, vecBurstDir );
+
+	vecBurstDir *= (flActualSpeed - m_vecBurstPredictedSpeed) * flPredictTime;
+	vecBurstDir /= (nShotsTillPredict - 1);
+
+	m_vecBurstPredictedSpeed = flActualSpeed; 
+	m_vecBurstDelta += vecBurstDir;
+}
+
+void CNPC_MetroPolice::SteerBurstTowardTargetUseVelocity( const Vector &vecShootAt, const Vector &vecShootAtVelocity, int nShotsTillPredict )
+{
+	// Only account for all velocity changes
+	// This one looks scary in that it always gets near to the player,
+	// but it never usually hits actually.
+	Vector vecBurstDir = m_vecBurstLineOfDeathDelta;
+	m_vecBurstLineOfDeathDelta = vecShootAtVelocity;
+	vecBurstDir = vecShootAtVelocity - vecBurstDir;
+	vecBurstDir /= (nShotsTillPredict - 1);
+
+	m_vecBurstDelta += vecBurstDir;
+}
+
+void CNPC_MetroPolice::SteerBurstTowardTargetUsePosition( const Vector &vecShootAt, const Vector &vecShootAtVelocity, int nShotsTillPredict )
+{
+	// Account for velocity + position changes
+	// This method *always* hits
+	VectorSubtract( vecShootAt, m_vecBurstTargetPos, m_vecBurstDelta );
+	m_vecBurstDelta /= (nShotsTillPredict - 1);
+}
+
+void CNPC_MetroPolice::SteerBurstTowardPredictedPoint( const Vector &vecShootAt, const Vector &vecShootAtVelocity, int nShotsTillPredict )
+{
+	// Account for velocity + position changes, but only within a constrained cylinder
+	Vector vecConstrainedShootPosition;
+	CalcClosestPointOnLine( vecShootAt, m_vecBurstLineOfDeathOrigin, m_vecBurstLineOfDeathOrigin + m_vecBurstLineOfDeathDelta, vecConstrainedShootPosition );
+
+	Vector vecDelta;
+	VectorSubtract( vecShootAt, vecConstrainedShootPosition, vecDelta );
+	if ( vecDelta.LengthSqr( ) <= m_flBurstSteerDistance * m_flBurstSteerDistance )
+	{
+		vecConstrainedShootPosition = vecShootAt;
+	}
+	else
+	{
+		VectorNormalize( vecDelta );
+		VectorMA( vecConstrainedShootPosition, m_flBurstSteerDistance, vecDelta, vecConstrainedShootPosition );
+	}
+
+	// This method *always* hits if the entity is within the cylinder
+	VectorSubtract( vecConstrainedShootPosition, m_vecBurstTargetPos, m_vecBurstDelta );
+	if ( nShotsTillPredict >= 2 )
+	{
+		m_vecBurstDelta /= (nShotsTillPredict - 1);
+	}
+}
+
+#define STEER_LINE_OF_DEATH_MAX_DISTANCE	250.0f
+
+void CNPC_MetroPolice::SteerBurstWithinLineOfDeath( )
+{
+	// Account for velocity + position changes, but only within a constrained cylinder
+	Vector vecShootAt;
+	vecShootAt = StitchAimTarget( GetAbsOrigin(), false );
+
+	// If the target close to the current point the shot is on,
+	// move the shot toward the point
+	Vector vecPointOnLineOfDeath;
+	CalcClosestPointOnLine( m_vecBurstTargetPos, m_vecBurstLineOfDeathOrigin, m_vecBurstLineOfDeathOrigin + m_vecBurstLineOfDeathDelta, vecPointOnLineOfDeath );
+
+	Vector vecDelta;
+	VectorSubtract( vecShootAt, vecPointOnLineOfDeath, vecDelta );
+	if ( vecDelta.LengthSqr( ) <= m_flBurstSteerDistance * m_flBurstSteerDistance )
+	{
+		VectorSubtract( vecShootAt, m_vecBurstTargetPos, m_vecBurstDelta );
+		if ( m_vecBurstDelta.LengthSqr() > (STEER_LINE_OF_DEATH_MAX_DISTANCE * STEER_LINE_OF_DEATH_MAX_DISTANCE) )
+		{
+			VectorNormalize( m_vecBurstDelta );
+			m_vecBurstDelta *= STEER_LINE_OF_DEATH_MAX_DISTANCE;
+		}
+	}
+	else
+	{
+		// Just make the burst go back and forth alont the line of death...
+		Vector vecNext = m_vecBurstTargetPos + m_vecBurstDelta;
+
+		float t;
+		CalcClosestPointOnLine( vecNext, m_vecBurstLineOfDeathOrigin, m_vecBurstLineOfDeathOrigin + m_vecBurstLineOfDeathDelta, vecPointOnLineOfDeath, &t );
+		if (( t < -0.1f ) || ( t > 1.1f ))
+		{
+			m_vecBurstDelta *= -1.0f;
+
+			// This is necessary to make it not look like a machine is firing the gun
+			Vector vecBurstDir = m_vecBurstDelta;
+			float flLength = VectorNormalize( vecBurstDir );
+			vecBurstDir *= random->RandomFloat( -flLength * 0.5f, flLength * 0.5f );
+
+			m_vecBurstTargetPos += vecBurstDir;
+		}
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SteerBurstTowardTarget( )
+{
+	switch ( m_nBurstSteerMode )
+	{
+	case BURST_STEER_NONE:
+		return;
+
+	case BURST_STEER_EXACTLY_TOWARD_TARGET:
+		// Necessary to get the cop looking at the target
+		m_vecBurstTargetPos = GetEnemy()->WorldSpaceCenter();
+		return;
+ 
+	case BURST_STEER_ADJUST_FOR_SPEED_CHANGES:
+		{
+			// Predict the airboat position at the point where we were expecting to hit them
+			if ( m_flBurstPredictTime <= gpGlobals->curtime )
+				return;
+
+			float flPredictTime = m_flBurstPredictTime - gpGlobals->curtime;
+			int nShotsTillPredict = CountShotsInTime( flPredictTime );
+			if ( nShotsTillPredict <= 1 )
+				return;
+
+			Vector vecShootAt, vecShootAtVelocity;
+			PredictShootTargetPosition( flPredictTime, 0.0f, 0.0f, &vecShootAt, &vecShootAtVelocity );
+			SteerBurstTowardTargetUseSpeedOnly( vecShootAt, vecShootAtVelocity, flPredictTime, nShotsTillPredict );
+		}
+		break;
+
+	case BURST_STEER_TOWARD_PREDICTED_POINT:
+		// Don't course-correct until the predicted time
+		if ( m_flBurstPredictTime >= gpGlobals->curtime )
+			return;
+
+		// fall through!
+
+	case BURST_STEER_WITHIN_LINE_OF_DEATH:
+		break;
+	}
+
+	SteerBurstWithinLineOfDeath( );
+}
+
+
+//-----------------------------------------------------------------------------
+// Various burst trajectory methods
+//-----------------------------------------------------------------------------
+Vector CNPC_MetroPolice::ComputeBurstLockOnTrajectory( const Vector &shootOrigin )
+{
+	Vector vecTrajectory;
+	VectorSubtract( GetEnemy()->WorldSpaceCenter(), shootOrigin, vecTrajectory );
+	VectorNormalize( vecTrajectory );
+	return vecTrajectory;
+}
+
+Vector CNPC_MetroPolice::ComputeBurstDeliberatelyMissTrajectory( const Vector &shootOrigin )
+{
+	m_vecBurstTargetPos.z += 8.0f;
+
+	Vector vecTrajectory;
+	VectorSubtract( m_vecBurstTargetPos, shootOrigin, vecTrajectory );
+	VectorNormalize( vecTrajectory );
+	return vecTrajectory;
+}
+
+Vector CNPC_MetroPolice::ComputeBurstTrajectory( const Vector &shootOrigin )
+{
+	// Perform the stitch
+	Vector vecPos = m_vecBurstTargetPos;
+
+	// For players, don't let them jump over the burst.
+	CBaseEntity *pEnemy = GetEnemy();
+	bool bIsPlayerOnFoot = pEnemy && pEnemy->IsPlayer() && !IsEnemyInAnAirboat();
+	if ( bIsPlayerOnFoot )
+	{
+		Vector vecNormalizedPt;
+		pEnemy->CollisionProp()->WorldToNormalizedSpace( vecPos, &vecNormalizedPt );
+		if ( (vecNormalizedPt.x >= -0.1f) && (vecNormalizedPt.x <= 1.1f) &&
+			(vecNormalizedPt.y >= -0.1f) && (vecNormalizedPt.y <= 1.1f) &&
+			(vecNormalizedPt.z >= -0.7f) && (vecNormalizedPt.z < 1.1f) )
+		{
+ 			vecPos.z = pEnemy->WorldSpaceCenter().z;
+		}
+	}
+
+	vecPos -= shootOrigin;
+
+	// Add a little noise. Even though it's non-physical, it looks better
+	// to have the same amount of noise regardless of distance from the shooter
+	// Always make the noise perpendicular to the burst direction
+	float flNoise = bIsPlayerOnFoot ? 16.0f : 32.0f;
+	Vector vecNoise;
+	CrossProduct( m_vecBurstDelta, Vector( 0, 0, 1 ), vecNoise );
+	VectorNormalize( vecNoise );
+	vecNoise *= random->RandomFloat( -flNoise, flNoise );
+	vecPos += vecNoise;
+
+	VectorNormalize( vecPos );
+
+	// X360BUG: Was causing compiler crash in release, still?
+//	if ( IsPC() )
+	{
+		// Allow for steering towards the target.
+		SteerBurstTowardTarget();
+	}
+	
+	// Update the burst target position
+	m_vecBurstTargetPos += m_vecBurstDelta;
+	
+//	NDebugOverlay::Cross3D( m_vecBurstTargetPos, -Vector(32,32,32), Vector(32,32,32), 255, 0, 255, false, 1.0f );
+
+	return vecPos;
+}
+
+
+//-----------------------------------------------------------------------------
+// Deliberately aims as close as possible w/o hitting
+//-----------------------------------------------------------------------------
+Vector CNPC_MetroPolice::AimCloseToTargetButMiss( CBaseEntity *pTarget, const Vector &shootOrigin )
+{
+	Vector vecNormalizedSpace;
+	pTarget->CollisionProp()->WorldToNormalizedSpace( shootOrigin, &vecNormalizedSpace );
+	vecNormalizedSpace -= Vector( 0.5f, 0.5f, 0.5f );
+	float flDist = VectorNormalize( vecNormalizedSpace );
+	float flMinRadius = flDist * sqrt(3.0) / sqrt( flDist * flDist - 3 );
+
+	// Choose random points in a plane perpendicular to the shoot origin.
+	Vector vecRandomDir;
+	vecRandomDir.Random( -1.0f, 1.0f );
+	VectorMA( vecRandomDir, -DotProduct( vecNormalizedSpace, vecRandomDir ), vecNormalizedSpace, vecRandomDir );
+	VectorNormalize( vecRandomDir );
+	vecRandomDir *= flMinRadius;
+
+	vecRandomDir *= 0.5f;
+	vecRandomDir += Vector( 0.5f, 0.5f, 0.5f );
+
+	Vector vecBodyTarget;
+	pTarget->CollisionProp()->NormalizedToWorldSpace( vecRandomDir, &vecBodyTarget );
+	vecBodyTarget -= shootOrigin;
+	return vecBodyTarget;
+}
+
+
+//-----------------------------------------------------------------------------
+// A burst that goes right at the enemy
+//-----------------------------------------------------------------------------
+#define MIN_TIGHT_BURST_DIST 1000.0f
+#define MAX_TIGHT_BURST_DIST 2000.0f
+
+Vector CNPC_MetroPolice::ComputeTightBurstTrajectory( const Vector &shootOrigin )
+{
+	CBaseEntity *pEnemy = GetEnemy();
+	if ( !pEnemy )
+	{
+		return BaseClass::GetActualShootTrajectory( shootOrigin );
+	}
+
+	// Aim around the player...
+	if ( m_nBurstHits >= m_nMaxBurstHits )
+	{
+		return AimCloseToTargetButMiss( pEnemy, shootOrigin );
+	}
+
+	float flDist = shootOrigin.DistTo( pEnemy->WorldSpaceCenter() );
+	float flMin = -0.2f;
+	float flMax = 1.2f;
+	if ( flDist > MIN_TIGHT_BURST_DIST )
+	{
+		flDist = clamp( flDist, MIN_TIGHT_BURST_DIST, MAX_TIGHT_BURST_DIST );
+		flMin = SimpleSplineRemapVal( flDist, MIN_TIGHT_BURST_DIST, MAX_TIGHT_BURST_DIST, -0.2f, -0.7f );
+		flMax = SimpleSplineRemapVal( flDist, MIN_TIGHT_BURST_DIST, MAX_TIGHT_BURST_DIST, 1.2f, 1.7f );
+	}
+
+	// Aim randomly at the player. Since body target uses the vehicle body target,
+	// we instead are going to not use it
+	Vector vecBodyTarget;
+	pEnemy->CollisionProp()->RandomPointInBounds( Vector( flMin, flMin, flMin ), Vector( flMax, flMax, flMax * 0.75f ), &vecBodyTarget );
+	vecBodyTarget -= shootOrigin;
+	return vecBodyTarget;
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+Vector CNPC_MetroPolice::GetActualShootTrajectory( const Vector &shootOrigin )
+{
+	switch ( m_nBurstMode )
+	{
+	case BURST_NOT_ACTIVE:
+		return BaseClass::GetActualShootTrajectory( shootOrigin );
+
+	case BURST_LOCKED_ON:
+		if ( m_nBurstHits < m_nMaxBurstHits )
+		{
+			return ComputeBurstLockOnTrajectory( shootOrigin );
+		}
+
+		// Start shooting over the head of the enemy
+		GetShootTarget()->CollisionProp()->NormalizedToWorldSpace( Vector( 0.5f, 0.5f, 1.0f ), &m_vecBurstTargetPos );
+		m_nBurstMode = BURST_DELIBERATELY_MISS;
+		// NOTE: Fall through to BURST_DELIBERATELY_MISS!!
+
+	case BURST_DELIBERATELY_MISS:
+		return ComputeBurstDeliberatelyMissTrajectory( shootOrigin );
+
+	case BURST_LOCK_ON_AFTER_HIT:
+		// See if our target is within the bounds of the enemy
+		if ( GetShootTarget()->CollisionProp()->IsPointInBounds( m_vecBurstTargetPos ) )
+		{
+			// Now raytrace against only the world + (good for cops on bridges)
+			trace_t tr;
+			CTraceFilterWorldOnly traceFilter;
+			UTIL_TraceLine( Weapon_ShootPosition(), m_vecBurstTargetPos, MASK_SOLID, &traceFilter, &tr );
+			if ( tr.fraction == 1.0f )
+			{
+				m_nBurstMode = BURST_LOCKED_ON;
+			}
+		}
+		// NOTE: Fall through to BURST_ACTIVE!
+
+	case BURST_ACTIVE:
+		// Stitch toward the target, we haven't hit it yet
+		return ComputeBurstTrajectory( shootOrigin );
+
+	case BURST_TIGHT_GROUPING:
+		// This one goes right at the enemy
+		return ComputeTightBurstTrajectory( shootOrigin );
+	}
+
+	Assert(0);
+	return vec3_origin;
+}
+
+
+//-----------------------------------------------------------------------------
+// Burst mode!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::FireBullets( const FireBulletsInfo_t &info )
+{
+	CBaseEntity *pEnemy = GetEnemy();
+	bool bIsPlayer = pEnemy && pEnemy->IsPlayer();
+	if ( bIsPlayer && IsCurrentlyFiringBurst() )
+	{
+		FireBulletsInfo_t actualInfo = info;
+		if ( m_nBurstHits < m_nMaxBurstHits )
+		{
+			CBasePlayer *pPlayer = assert_cast<CBasePlayer*>(pEnemy);
+
+			// This makes it so that if the player gets hit underwater, 
+			// he won't take damage if his viewpoint is above water.
+			if ( !IsEnemyInAnAirboat() && ( pPlayer->GetWaterLevel() != 3 ) )
+			{
+				actualInfo.m_nFlags |= FIRE_BULLETS_DONT_HIT_UNDERWATER;
+			}
+
+			// This test is here to see if we've damaged the player
+			int nPrevHealth = pPlayer->GetHealth();
+			int nPrevArmor = pPlayer->ArmorValue();
+
+			BaseClass::FireBullets( actualInfo );
+
+			if (( pPlayer->GetHealth() < nPrevHealth ) || ( pPlayer->ArmorValue() < nPrevArmor ))
+			{
+				++m_nBurstHits;
+			}
 		}
 		else
 		{
-#ifdef COMBINE_SOLDIER_USES_RESPONSE_SYSTEM
-			SpeakIfAllowed(TLK_CMB_ANSWER, UTIL_VarArgs("combinequestion:%d", g_fCombineQuestion));
-			g_fCombineQuestion = 0;
-#else
-			switch (g_fCombineQuestion)
-			{
-			case 1: // check in
-				if (m_Sentences.Speak("COMBINE_CLEAR") >= 0)
-				{
-					g_fCombineQuestion = 0;
-				}
-				break;
-			case 2: // question 
-				if (m_Sentences.Speak("COMBINE_ANSWER") >= 0)
-				{
-					g_fCombineQuestion = 0;
-				}
-				break;
-			}
-#endif
+			actualInfo.m_pAdditionalIgnoreEnt = pEnemy;
+			BaseClass::FireBullets( actualInfo ); 
 		}
 	}
+	else
+	{
+		BaseClass::FireBullets( info );
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Behaviors! Lovely behaviors
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::CreateBehaviors()
+{
+	AddBehavior( &m_RappelBehavior );
+	AddBehavior( &m_FollowBehavior );
+	AddBehavior( &m_PolicingBehavior );
+	AddBehavior( &m_ActBusyBehavior );
+	AddBehavior( &m_AssaultBehavior );
+	AddBehavior( &m_StandoffBehavior );
+	AddBehavior( &m_FuncTankBehavior );
+	
+	return BaseClass::CreateBehaviors();
+}
+
+void CNPC_MetroPolice::InputEnableManhackToss( inputdata_t &inputdata )
+{
+	if ( HasSpawnFlags( SF_METROPOLICE_NO_MANHACK_DEPLOY ) )
+	{
+		RemoveSpawnFlags( SF_METROPOLICE_NO_MANHACK_DEPLOY );
+	}
+}
+
+#ifdef MAPBASE
+void CNPC_MetroPolice::InputDisableManhackToss( inputdata_t &inputdata )
+{
+	if ( !HasSpawnFlags( SF_METROPOLICE_NO_MANHACK_DEPLOY ) )
+	{
+		AddSpawnFlags( SF_METROPOLICE_NO_MANHACK_DEPLOY );
+	}
+}
+
+void CNPC_MetroPolice::InputDeployManhack( inputdata_t &inputdata )
+{
+	// I am aware this bypasses regular deployment conditions, but the mapper wants us to deploy a manhack, damn it!
+	// We do have to have one, though.
+	if ( m_iManhacks > 0 )
+	{
+		SetSchedule(SCHED_METROPOLICE_DEPLOY_MANHACK);
+	}
+}
+
+void CNPC_MetroPolice::InputAddManhacks( inputdata_t &inputdata )
+{
+	m_iManhacks += inputdata.value.Int();
+
+	SetBodygroup( METROPOLICE_BODYGROUP_MANHACK, (m_iManhacks > 0) );
+}
+
+void CNPC_MetroPolice::InputSetManhacks( inputdata_t &inputdata )
+{
+	m_iManhacks = inputdata.value.Int();
+
+	SetBodygroup( METROPOLICE_BODYGROUP_MANHACK, (m_iManhacks > 0) );
+}
+#endif
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &inputdata - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::InputSetPoliceGoal( inputdata_t &inputdata )
+{
+#ifdef MAPBASE
+	if (/*!inputdata.value.String() ||*/ inputdata.value.String()[0] == 0)
+	{
+		m_PolicingBehavior.Disable();
+		return;
+	}
+#endif
+
+	CBaseEntity *pGoal = gEntList.FindEntityByName( NULL, inputdata.value.String() );
+
+	if ( pGoal == NULL )
+	{
+		DevMsg( "SetPoliceGoal: %s (%s) unable to find ai_goal_police: %s\n", GetClassname(), GetDebugName(), inputdata.value.String() );
+		return;
+	}
+
+	CAI_PoliceGoal *pPoliceGoal = dynamic_cast<CAI_PoliceGoal *>(pGoal);
+
+	if ( pPoliceGoal == NULL )
+	{
+		DevMsg( "SetPoliceGoal: %s (%s)'s target %s is not an ai_goal_police entity!\n", GetClassname(), GetDebugName(), inputdata.value.String() );
+		return;
+	}
+
+	m_PolicingBehavior.Enable( pPoliceGoal );
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &inputdata - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::InputActivateBaton( inputdata_t &inputdata )
+{
+	SetBatonState( inputdata.value.Bool() );
+}
+
+#ifdef MAPBASE
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &inputdata - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::InputAdministerJustice( inputdata_t &inputdata )
+{
+	AdministerJustice();
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &inputdata - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::InputAddWarnings( inputdata_t &inputdata )
+{
+	m_nNumWarnings += inputdata.value.Int();
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &inputdata - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::InputSetWarnings( inputdata_t &inputdata )
+{
+	m_nNumWarnings = inputdata.value.Int();
+}
+#endif
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AlertSound( void )
+{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	SpeakIfAllowed( TLK_COP_GO_ALERT );
+#else
+	m_Sentences.Speak( "METROPOLICE_GO_ALERT" );
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::DeathSound( const CTakeDamageInfo &info )
+{
+	if ( IsOnFire() )
+		return;
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	AI_CriteriaSet set;
+	ModifyOrAppendDamageCriteria(set, info);
+	SpeakIfAllowed( TLK_COP_DIE, set, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#else
+	m_Sentences.Speak( "METROPOLICE_DIE", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: implemented by subclasses to give them an opportunity to make
+//			a sound when they lose their enemy
+// Input  :
+// Output :
+//-----------------------------------------------------------------------------
+#ifdef MAPBASE
+void CNPC_MetroPolice::LostEnemySound( CBaseEntity *pEnemy )
+#else
+void CNPC_MetroPolice::LostEnemySound( void)
+#endif
+{
+	// Don't announce enemies when the player isn't a criminal
+	if ( !PlayerIsCriminal() )
+		return;
+
+	if ( gpGlobals->curtime <= m_flNextLostSoundTime )
+		return;
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	AI_CriteriaSet modifiers;
+	ModifyOrAppendEnemyCriteria( modifiers, pEnemy );
+
+	modifiers.AppendCriteria( "lastseenenemy", gpGlobals->curtime - GetEnemies()->LastTimeSeen( pEnemy ) );
+
+	if (SpeakIfAllowed(TLK_COP_LOSTENEMY, modifiers ))
+	{
+		m_flNextLostSoundTime = gpGlobals->curtime + random->RandomFloat(5.0,15.0);
+	}
+#else
+	const char *pSentence;
+	if (!(CBaseEntity*)GetEnemy() || gpGlobals->curtime - GetEnemyLastTimeSeen() > 10)
+	{
+		pSentence = "METROPOLICE_LOST_LONG"; 
+	}
+	else
+	{
+		pSentence = "METROPOLICE_LOST_SHORT";
+	}
+
+	if ( m_Sentences.Speak( pSentence ) >= 0 )
+	{
+		m_flNextLostSoundTime = gpGlobals->curtime + random->RandomFloat(5.0,15.0);
+	}
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: implemented by subclasses to give them an opportunity to make
+//			a sound when they lose their enemy
+// Input  :
+// Output :
+//-----------------------------------------------------------------------------
+#ifdef MAPBASE
+void CNPC_MetroPolice::FoundEnemySound( CBaseEntity *pEnemy )
+#else
+void CNPC_MetroPolice::FoundEnemySound( void)
+#endif
+{
+	// Don't announce enemies when I'm in arrest behavior
+	if ( HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) )
+		return;
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	AI_CriteriaSet modifiers;
+	ModifyOrAppendEnemyCriteria( modifiers, pEnemy );
+
+	SpeakIfAllowed( TLK_COP_REFINDENEMY, modifiers, SENTENCE_PRIORITY_HIGH );
+#else
+	m_Sentences.Speak( "METROPOLICE_REFIND_ENEMY", SENTENCE_PRIORITY_HIGH );
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: Indicates whether or not this npc should play an idle sound now.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::ShouldPlayIdleSound( void )
+{
+	// If someone is waiting for a response, then respond!
+	if ( ( m_NPCState == NPC_STATE_IDLE ) || ( m_NPCState == NPC_STATE_ALERT ) )
+	{
+		if ( m_nIdleChatterType >= METROPOLICE_CHATTER_RESPONSE )
+			return FOkToMakeSound();
+	}
+
+	return BaseClass::ShouldPlayIdleSound();
+}
+
+
+//-----------------------------------------------------------------------------
+// IdleSound 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::IdleSound( void )
+{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	// This happens when the NPC is waiting for his buddies to respond to him
+	switch( m_nIdleChatterType )
+	{
+	case METROPOLICE_CHATTER_WAIT_FOR_RESPONSE:
+		break;
+
+	case METROPOLICE_CHATTER_ASK_QUESTION:
+		{
+			if ( m_bPlayerIsNear && !HasMemory(bits_MEMORY_PLAYER_HARASSED) )
+			{
+				if ( SpeakIfAllowed( TLK_COP_HARASS, SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL ) )
+				{
+					Remember( bits_MEMORY_PLAYER_HARASSED );
+					if ( GetSquad() )
+					{
+						GetSquad()->SquadRemember(bits_MEMORY_PLAYER_HARASSED);
+					}
+				}
+				return;
+			}
+
+			if ( !random->RandomInt(0,1) )
+				break;
+
+			int nQuestionType = random->RandomInt( 0, METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT );
+			if ( !IsInSquad() || ( nQuestionType == METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT ) )
+			{
+				SpeakIfAllowed(TLK_COP_IDLE);
+				break;
+			}
+
+			if ( SpeakIfAllowed( TLK_COP_QUESTION, UTIL_VarArgs("combinequestion:%d", nQuestionType) ) )
+			{
+				GetSquad()->BroadcastInteraction( g_interactionMetrocopIdleChatter, (void*)(METROPOLICE_CHATTER_RESPONSE + nQuestionType), this );
+				m_nIdleChatterType = METROPOLICE_CHATTER_WAIT_FOR_RESPONSE;
+			}
+		}
+		break;
+
+	default:
+		{
+			int nResponseType = m_nIdleChatterType - METROPOLICE_CHATTER_RESPONSE;
+
+			if ( SpeakIfAllowed( TLK_COP_ANSWER, UTIL_VarArgs("combinequestion:%d", nResponseType) ) )
+			{
+				GetSquad()->BroadcastInteraction( g_interactionMetrocopIdleChatter, (void*)(METROPOLICE_CHATTER_ASK_QUESTION), this );
+				m_nIdleChatterType = METROPOLICE_CHATTER_ASK_QUESTION;
+			}
+		}
+		break;
+	}
+#else
+	bool bIsCriminal = PlayerIsCriminal();
+
+	// This happens when the NPC is waiting for his buddies to respond to him
+	switch( m_nIdleChatterType )
+	{
+	case METROPOLICE_CHATTER_WAIT_FOR_RESPONSE:
+		break;
+
+	case METROPOLICE_CHATTER_ASK_QUESTION:
+		{
+			if ( m_bPlayerIsNear && !HasMemory(bits_MEMORY_PLAYER_HARASSED) )
+			{
+				if ( m_Sentences.Speak( "METROPOLICE_IDLE_HARASS_PLAYER", SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL ) >= 0 )
+				{
+					Remember( bits_MEMORY_PLAYER_HARASSED );
+					if ( GetSquad() )
+					{
+						GetSquad()->SquadRemember(bits_MEMORY_PLAYER_HARASSED);
+					}
+				}
+				return;
+			}
+
+			if ( !random->RandomInt(0,1) )
+				break;
+
+			int nQuestionType = random->RandomInt( 0, METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT );
+			if ( !IsInSquad() || ( nQuestionType == METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT ) )
+			{
+				m_Sentences.Speak( bIsCriminal ? "METROPOLICE_IDLE_CR" : "METROPOLICE_IDLE" );
+				break;
+			}
+
+			static const char *pQuestion[2][METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT] = 
+			{
+				{ "METROPOLICE_IDLE_CHECK",		"METROPOLICE_IDLE_QUEST" },
+				{ "METROPOLICE_IDLE_CHECK_CR",	"METROPOLICE_IDLE_QUEST_CR" },
+			};
+
+			if ( m_Sentences.Speak( pQuestion[bIsCriminal][nQuestionType] ) >= 0 )
+			{
+				GetSquad()->BroadcastInteraction( g_interactionMetrocopIdleChatter, (void*)(METROPOLICE_CHATTER_RESPONSE + nQuestionType), this );
+				m_nIdleChatterType = METROPOLICE_CHATTER_WAIT_FOR_RESPONSE;
+			}
+		}
+		break;
+
+	default:
+		{
+			int nResponseType = m_nIdleChatterType - METROPOLICE_CHATTER_RESPONSE;
+
+			static const char *pResponse[2][METROPOLICE_CHATTER_RESPONSE_TYPE_COUNT] = 
+			{
+				{ "METROPOLICE_IDLE_CLEAR",		"METROPOLICE_IDLE_ANSWER" },
+				{ "METROPOLICE_IDLE_CLEAR_CR",	"METROPOLICE_IDLE_ANSWER_CR" },
+			};
+
+			if ( m_Sentences.Speak( pResponse[bIsCriminal][nResponseType] ) >= 0 )
+			{
+				GetSquad()->BroadcastInteraction( g_interactionMetrocopIdleChatter, (void*)(METROPOLICE_CHATTER_ASK_QUESTION), this );
+				m_nIdleChatterType = METROPOLICE_CHATTER_ASK_QUESTION;
+			}
+		}
+		break;
+	}
+#endif
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::PainSound( const CTakeDamageInfo &info )
+{
+	if ( gpGlobals->curtime < m_flNextPainSoundTime )
+		return;
+
+	// Don't make pain sounds if I'm on fire. The looping sound will take care of that for us.
+	if ( IsOnFire() )
+		return;
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	AI_CriteriaSet set;
+	ModifyOrAppendDamageCriteria(set, info);
+	SpeakIfAllowed(TLK_COP_PAIN, set, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS);
+	m_flNextPainSoundTime = gpGlobals->curtime + 1;
+#else
+	float healthRatio = (float)GetHealth() / (float)GetMaxHealth();
+	if ( healthRatio > 0.0f )
+	{
+		const char *pSentenceName = "METROPOLICE_PAIN";
+		if ( !HasMemory(bits_MEMORY_PAIN_HEAVY_SOUND) && (healthRatio < 0.25f) )
+		{
+			Remember( bits_MEMORY_PAIN_HEAVY_SOUND | bits_MEMORY_PAIN_LIGHT_SOUND );
+			pSentenceName = "METROPOLICE_PAIN_HEAVY";
+		}
+		else if ( !HasMemory(bits_MEMORY_PAIN_LIGHT_SOUND) && healthRatio > 0.8f )
+		{
+			Remember( bits_MEMORY_PAIN_LIGHT_SOUND );
+			pSentenceName = "METROPOLICE_PAIN_LIGHT";
+		}
+		
+		// This causes it to speak it no matter what; doesn't bother with setting sounds.
+		m_Sentences.Speak( pSentenceName, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+		m_flNextPainSoundTime = gpGlobals->curtime + 1;
+	}
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::GetSoundInterests( void )
+{
+	return SOUND_WORLD | SOUND_COMBAT | SOUND_PLAYER | SOUND_PLAYER_VEHICLE | SOUND_DANGER | 
+		SOUND_PHYSICS_DANGER | SOUND_BULLET_IMPACT | SOUND_MOVE_AWAY;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+float CNPC_MetroPolice::MaxYawSpeed( void )
+{
+	switch( GetActivity() )
+	{
+	case ACT_TURN_LEFT:
+	case ACT_TURN_RIGHT:
+		return 120;
+
+	case ACT_RUN:
+	case ACT_RUN_HURT:
+		return 15;
+
+	case ACT_WALK:
+	case ACT_WALK_CROUCH:
+	case ACT_RUN_CROUCH:
+		return 25;
+
+	default:
+		return 45;
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//
+//
+//-----------------------------------------------------------------------------
+Class_T	CNPC_MetroPolice::Classify ( void )
+{
+	return CLASS_METROPOLICE;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::PlayerIsCriminal( void )
+{
+	if ( m_PolicingBehavior.IsEnabled() && m_PolicingBehavior.TargetIsHostile() )
+		return true;
+
+	if ( GlobalEntity_GetState( "gordon_precriminal" ) == GLOBAL_ON )
+		return false;
+
+	return true;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: Overridden because if the player is a criminal, we hate them.
+// Input  : pTarget - Entity with which to determine relationship.
+// Output : Returns relationship value.
+//-----------------------------------------------------------------------------
+Disposition_t CNPC_MetroPolice::IRelationType(CBaseEntity *pTarget)
+{
+	Disposition_t disp = BaseClass::IRelationType(pTarget);
+
+	if ( pTarget == NULL )
+		return disp;
+
+	// If the player's not a criminal, then we don't necessary hate him
+	if ( pTarget->Classify() == CLASS_PLAYER )
+	{
+		if ( !PlayerIsCriminal() && (disp == D_HT) )
+		{
+			// If we're pissed at the player, we're allowed to hate them.
+			if ( m_flChasePlayerTime && m_flChasePlayerTime > gpGlobals->curtime )
+				return D_HT;
+			return D_NU;
+		}
+	}
+
+	return disp;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : *pEvent - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnAnimEventStartDeployManhack( void )
+{
+	Assert( m_iManhacks );
+	
+	if ( m_iManhacks <= 0 )
+	{
+		CGMsg( 1, CON_GROUP_NPC_AI, "Error: Throwing manhack but out of manhacks!\n" );
+		return;
+	}
+
+	m_iManhacks--;
+
+	// Turn off the manhack on our body
+	if ( m_iManhacks <= 0 )
+	{
+		SetBodygroup( METROPOLICE_BODYGROUP_MANHACK, false );
+	}
+
+	// Create the manhack to throw
+	CNPC_Manhack *pManhack = (CNPC_Manhack *)CreateEntityByName( "npc_manhack" );
+	
+	Vector	vecOrigin;
+	QAngle	vecAngles;
+
+	int handAttachment = LookupAttachment( "LHand" );
+	GetAttachment( handAttachment, vecOrigin, vecAngles );
+
+	pManhack->SetLocalOrigin( vecOrigin );
+	pManhack->SetLocalAngles( vecAngles );
+	pManhack->AddSpawnFlags( (SF_MANHACK_PACKED_UP|SF_MANHACK_CARRIED|SF_NPC_WAIT_FOR_SCRIPT) );
+	
+	// Also fade if our parent is marked to do it
+	if ( HasSpawnFlags( SF_NPC_FADE_CORPSE ) )
+	{
+		pManhack->AddSpawnFlags( SF_NPC_FADE_CORPSE );
+	}
+
+	pManhack->Spawn();
+
+	// Make us move with his hand until we're deployed
+	pManhack->SetParent( this, handAttachment );
+
+	m_hManhack = pManhack;
+
+#ifdef MAPBASE
+	m_OutManhack.Set(m_hManhack, pManhack, this);
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// Anim event handlers
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnAnimEventDeployManhack( animevent_t *pEvent )
+{
+	// Let it go
+	ReleaseManhack();
+
+	Vector forward, right;
+	GetVectors( &forward, &right, NULL );
+
+	IPhysicsObject *pPhysObj = m_hManhack->VPhysicsGetObject();
+
+	if ( pPhysObj )
+	{
+		Vector	yawOff = right * random->RandomFloat( -1.0f, 1.0f );
+
+		Vector	forceVel = ( forward + yawOff * 16.0f ) + Vector( 0, 0, 250 );
+		Vector	forceAng = vec3_origin;
+
+		// Give us velocity
+		pPhysObj->AddVelocity( &forceVel, &forceAng );
+	}
+
+	// Stop dealing with this manhack
+	m_hManhack = NULL;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnAnimEventShove( void )
+{
+	CBaseEntity *pHurt = CheckTraceHullAttack( 16, Vector(-16,-16,-16), Vector(16,16,16), 15, DMG_CLUB, 1.0f, false );
+
+	if ( pHurt )
+	{
+		Vector vecForceDir = ( pHurt->WorldSpaceCenter() - WorldSpaceCenter() );
+
+		CBasePlayer *pPlayer = ToBasePlayer( pHurt );
+
+		if ( pPlayer != NULL )
+		{
+			//Kick the player angles
+			pPlayer->ViewPunch( QAngle( 8, 14, 0 ) );
+
+			Vector	dir = pHurt->GetAbsOrigin() - GetAbsOrigin();
+			VectorNormalize(dir);
+
+			QAngle angles;
+			VectorAngles( dir, angles );
+			Vector forward, right;
+			AngleVectors( angles, &forward, &right, NULL );
+
+			//If not on ground, then don't make them fly!
+			if ( !(pHurt->GetFlags() & FL_ONGROUND ) )
+				  forward.z = 0.0f;
+
+			//Push the target back
+			pHurt->ApplyAbsVelocityImpulse( forward * 250.0f );
+
+			// Force the player to drop anyting they were holding
+			pPlayer->ForceDropOfCarriedPhysObjects();
+		}
+
+		// Play a random attack hit sound
+		EmitSound( "NPC_Metropolice.Shove" );
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnAnimEventBatonOn( void )
+{
+#if !defined(HL2MP) || defined(MAPBASE)
+
+	CWeaponStunStick *pStick = dynamic_cast<CWeaponStunStick *>(GetActiveWeapon());
+
+	if ( pStick )
+	{
+		pStick->SetStunState( true );
+	}
+#endif
+
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnAnimEventBatonOff( void )
+{
+#if !defined(HL2MP) || defined(MAPBASE)
+
+	CWeaponStunStick *pStick = dynamic_cast<CWeaponStunStick *>(GetActiveWeapon());
+	
+	if ( pStick )
+	{
+		pStick->SetStunState( false );
+	}
+#endif
 }
 
 //-----------------------------------------------------------------------------
 // Purpose: 
 //
-//			This is for Grenade attacks.  As the test for grenade attacks
-//			is expensive we don't want to do it every frame.  Return true
-//			if we meet minimum set of requirements and then test for actual
-//			throw later if we actually decide to do a grenade attack.
-// Input  :
-// Output :
+// Input  : *pEvent - 
+//
 //-----------------------------------------------------------------------------
-int	CNPC_Combine::RangeAttack2Conditions(float flDot, float flDist)
+void CNPC_MetroPolice::HandleAnimEvent( animevent_t *pEvent )
 {
-	return COND_NONE;
-}
-
-#ifndef MAPBASE
-//-----------------------------------------------------------------------------
-// Purpose: Return true if the combine has grenades, hasn't checked lately, and
-//			can throw a grenade at the target point.
-// Input  : &vecTarget - 
-// Output : Returns true on success, false on failure.
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::CanThrowGrenade(const Vector& vecTarget)
-{
-	if (m_iNumGrenades < 1)
+	// Shove!
+	if ( pEvent->event == AE_METROPOLICE_SHOVE )
 	{
-		// Out of grenades!
-		return false;
+		OnAnimEventShove();
+		return;
 	}
 
-	if (gpGlobals->curtime < m_flNextGrenadeCheck)
+	if ( pEvent->event == AE_METROPOLICE_BATON_ON )
 	{
-		// Not allowed to throw another grenade right now.
-		return false;
+		OnAnimEventBatonOn();
+		return;
 	}
 
-	float flDist;
-	flDist = (vecTarget - GetAbsOrigin()).Length();
-
-	if (flDist > 1024 || flDist < 128)
+	if ( pEvent->event == AE_METROPOLICE_BATON_OFF )
 	{
-		// Too close or too far!
-		m_flNextGrenadeCheck = gpGlobals->curtime + 1; // one full second.
-		return false;
+		OnAnimEventBatonOff();
+		return;
 	}
 
-	// -----------------------
-	// If moving, don't check.
-	// -----------------------
-	if (m_flGroundSpeed != 0)
-		return false;
-
-#if 0
-	Vector vecEnemyLKP = GetEnemyLKP();
-	if (!(GetEnemy()->GetFlags() & FL_ONGROUND) && GetEnemy()->GetWaterLevel() == 0 && vecEnemyLKP.z > (GetAbsOrigin().z + WorldAlignMaxs().z))
+	if ( pEvent->event == AE_METROPOLICE_START_DEPLOY )
 	{
-		//!!!BUGBUG - we should make this check movetype and make sure it isn't FLY? Players who jump a lot are unlikely to 
-		// be grenaded.
-		// don't throw grenades at anything that isn't on the ground!
-		return COND_NONE;
+		OnAnimEventStartDeployManhack();
+		return;
 	}
-#endif
 
-	// ---------------------------------------------------------------------
-	// Are any of my squad members near the intended grenade impact area?
-	// ---------------------------------------------------------------------
-	if (m_pSquad)
+	if ( pEvent->event == AE_METROPOLICE_DRAW_PISTOL )
 	{
-		if (m_pSquad->SquadMemberInRange(vecTarget, COMBINE_MIN_GRENADE_CLEAR_DIST))
+		m_fWeaponDrawn = true;
+		if( GetActiveWeapon() )
 		{
-			// crap, I might blow my own guy up. Don't throw a grenade and don't check again for a while.
-			m_flNextGrenadeCheck = gpGlobals->curtime + 1; // one full second.
-
-			// Tell my squad members to clear out so I can get a grenade in
-			CSoundEnt::InsertSound(SOUND_MOVE_AWAY | SOUND_CONTEXT_COMBINE_ONLY, vecTarget, COMBINE_MIN_GRENADE_CLEAR_DIST, 0.1);
-			return false;
+			GetActiveWeapon()->RemoveEffects( EF_NODRAW );
 		}
+		return;
 	}
 
-	return CheckCanThrowGrenade(vecTarget);
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: Returns true if the combine can throw a grenade at the specified target point
-// Input  : &vecTarget - 
-// Output : Returns true on success, false on failure.
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::CheckCanThrowGrenade(const Vector& vecTarget)
-{
-	//NDebugOverlay::Line( EyePosition(), vecTarget, 0, 255, 0, false, 5 );
-
-	// ---------------------------------------------------------------------
-	// Check that throw is legal and clear
-	// ---------------------------------------------------------------------
-	// FIXME: this is only valid for hand grenades, not RPG's
-	Vector vecToss;
-	Vector vecMins = -Vector(4, 4, 4);
-	Vector vecMaxs = Vector(4, 4, 4);
-	if (FInViewCone(vecTarget) && CBaseEntity::FVisible(vecTarget))
+	if ( pEvent->event == AE_METROPOLICE_DEPLOY_MANHACK )
 	{
-		vecToss = VecCheckThrow(this, EyePosition(), vecTarget, COMBINE_GRENADE_THROW_SPEED, 1.0, &vecMins, &vecMaxs);
-	}
-	else
-	{
-		// Have to try a high toss. Do I have enough room?
-		trace_t tr;
-		AI_TraceLine(EyePosition(), EyePosition() + Vector(0, 0, 64), MASK_SHOT, this, COLLISION_GROUP_NONE, &tr);
-		if (tr.fraction != 1.0)
-		{
-			return false;
-		}
-
-		vecToss = VecCheckToss(this, EyePosition(), vecTarget, -1, 1.0, true, &vecMins, &vecMaxs);
+		OnAnimEventDeployManhack( pEvent );
+		return;
 	}
 
-	if (vecToss != vec3_origin)
-	{
-		m_vecTossVelocity = vecToss;
-
-		// don't check again for a while.
-		m_flNextGrenadeCheck = gpGlobals->curtime + 1; // 1/3 second.
-		return true;
-	}
-	else
-	{
-		// don't check again for a while.
-		m_flNextGrenadeCheck = gpGlobals->curtime + 1; // one full second.
-		return false;
-	}
-}
-#endif
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::CanAltFireEnemy(bool bUseFreeKnowledge)
-{
-#ifdef MAPBASE
-	if (!IsAltFireCapable())
-#else
-	if (!IsElite())
-#endif
-		return false;
-
-	if (IsCrouching())
-		return false;
-
-	if (gpGlobals->curtime < m_flNextAltFireTime)
-		return false;
-
-	if (!GetEnemy())
-		return false;
-
-	if (gpGlobals->curtime < m_flNextGrenadeCheck)
-		return false;
-
-	// See Steve Bond if you plan on changing this next piece of code!! (SJB) EP2_OUTLAND_10
-	if (m_iNumGrenades < 1)
-		return false;
-
-	CBaseEntity* pEnemy = GetEnemy();
-
-#ifdef MAPBASE
-	// "Our weapons alone cannot take down the antlion guard!"
-	// "Wait, you're an elite, don't you have, like, disintegration balls or somethi--"
-	// "SHUT UP!"
-	if (!npc_combine_altfire_not_allies_only.GetBool() && !pEnemy->IsPlayer() && (!pEnemy->IsNPC() || !pEnemy->MyNPCPointer()->IsPlayerAlly()))
-#else
-	if (!pEnemy->IsPlayer() && (!pEnemy->IsNPC() || !pEnemy->MyNPCPointer()->IsPlayerAlly()))
-#endif
-		return false;
-
-	Vector vecTarget;
-
-	// Determine what point we're shooting at
-	if (bUseFreeKnowledge)
-	{
-		vecTarget = GetEnemies()->LastKnownPosition(pEnemy) + (pEnemy->GetViewOffset() * 0.75);// approximates the chest
-	}
-	else
-	{
-		vecTarget = GetEnemies()->LastSeenPosition(pEnemy) + (pEnemy->GetViewOffset() * 0.75);// approximates the chest
-	}
-
-	// Trace a hull about the size of the combine ball (don't shoot through grates!)
-	trace_t tr;
-
-	Vector mins(-12, -12, -12);
-	Vector maxs(12, 12, 12);
-
-	Vector vShootPosition = EyePosition();
-
-	if (GetActiveWeapon())
-	{
-		GetActiveWeapon()->GetAttachment("muzzle", vShootPosition);
-	}
-
-	// Trace a hull about the size of the combine ball.
-#ifdef MAPBASE
-	UTIL_TraceHull(vShootPosition, vecTarget, mins, maxs, MASK_COMBINE_BALL_LOS, this, COLLISION_GROUP_NONE, &tr);
-#else
-	UTIL_TraceHull(vShootPosition, vecTarget, mins, maxs, MASK_SHOT, this, COLLISION_GROUP_NONE, &tr);
-#endif
-
-	float flLength = (vShootPosition - vecTarget).Length();
-
-	flLength *= tr.fraction;
-
-	//If the ball can travel at least 65% of the distance to the player then let the NPC shoot it.
-#ifdef MAPBASE
-	// (unless it hit the world)
-	if (tr.fraction >= 0.65 && (!tr.m_pEnt || !tr.m_pEnt->IsWorld()) && flLength > 128.0f)
-#else
-	if (tr.fraction >= 0.65 && flLength > 128.0f)
-#endif
-	{
-		// Target is valid
-		m_vecAltFireTarget = vecTarget;
-		return true;
-	}
-
-
-	// Check again later
-	m_vecAltFireTarget = vec3_origin;
-	m_flNextGrenadeCheck = gpGlobals->curtime + 1.0f;
-	return false;
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::CanGrenadeEnemy(bool bUseFreeKnowledge)
-{
-#ifdef MAPBASE
-	if (!IsGrenadeCapable())
-#else
-	if (IsElite())
-#endif
-		return false;
-
-	CBaseEntity* pEnemy = GetEnemy();
-
-	Assert(pEnemy != NULL);
-
-	if (pEnemy)
-	{
-		// I'm not allowed to throw grenades during dustoff
-		if (IsCurSchedule(SCHED_DROPSHIP_DUSTOFF))
-			return false;
-
-		if (bUseFreeKnowledge)
-		{
-			// throw to where we think they are.
-			return CanThrowGrenade(GetEnemies()->LastKnownPosition(pEnemy));
-		}
-		else
-		{
-			// hafta throw to where we last saw them.
-			return CanThrowGrenade(GetEnemies()->LastSeenPosition(pEnemy));
-		}
-	}
-
-	return false;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: For combine melee attack (kick/hit)
-// Input  :
-// Output :
-//-----------------------------------------------------------------------------
-int CNPC_Combine::MeleeAttack1Conditions(float flDot, float flDist)
-{
-	if (flDist > 64)
-	{
-		return COND_NONE; // COND_TOO_FAR_TO_ATTACK;
-	}
-	else if (flDot < 0.7)
-	{
-		return COND_NONE; // COND_NOT_FACING_ATTACK;
-	}
-
-	// Check Z
-	if (GetEnemy() && fabs(GetEnemy()->GetAbsOrigin().z - GetAbsOrigin().z) > 64)
-		return COND_NONE;
-
-	if (dynamic_cast<CBaseHeadcrab*>(GetEnemy()) != NULL)
-	{
-		return COND_NONE;
-	}
-
-	// Make sure not trying to kick through a window or something. 
-	trace_t tr;
-	Vector vecSrc, vecEnd;
-
-	vecSrc = WorldSpaceCenter();
-	vecEnd = GetEnemy()->WorldSpaceCenter();
-
-	AI_TraceLine(vecSrc, vecEnd, MASK_SHOT, this, COLLISION_GROUP_NONE, &tr);
-	if (tr.m_pEnt != GetEnemy())
-	{
-		return COND_NONE;
-	}
-
-	return COND_CAN_MELEE_ATTACK1;
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-// Output : Vector
-//-----------------------------------------------------------------------------
-Vector CNPC_Combine::EyePosition(void)
-{
-	if (!IsCrouching())
-	{
-		return GetAbsOrigin() + COMBINE_EYE_STANDING_POSITION;
-	}
-	else
-	{
-		return GetAbsOrigin() + COMBINE_EYE_CROUCHING_POSITION;
-	}
-
-	/*
-	Vector m_EyePos;
-	GetAttachment( "eyes", m_EyePos );
-	return m_EyePos;
-	*/
-}
-
-#ifndef MAPBASE
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-Vector CNPC_Combine::GetAltFireTarget()
-{
-	Assert(IsElite());
-
-	return m_vecAltFireTarget;
-}
-#endif
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-// Input  : nActivity - 
-// Output : Vector
-//-----------------------------------------------------------------------------
-Vector CNPC_Combine::EyeOffset(Activity nActivity)
-{
-	if (CapabilitiesGet() & bits_CAP_DUCK)
-	{
-		if (IsCrouchedActivity(nActivity))
-			return COMBINE_EYE_CROUCHING_POSITION;
-
-	}
-	// if the hint doesn't tell anything, assume current state
-	if (!IsCrouching())
-	{
-		return COMBINE_EYE_STANDING_POSITION;
-	}
-	else
-	{
-		return COMBINE_EYE_CROUCHING_POSITION;
-	}
-}
-
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-Vector CNPC_Combine::GetCrouchEyeOffset(void)
-{
-	return COMBINE_EYE_CROUCHING_POSITION;
-}
-
-#ifdef MAPBASE
-//-----------------------------------------------------------------------------
-// Purpose: 
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::IsCrouchedActivity(Activity activity)
-{
-	if (BaseClass::IsCrouchedActivity(activity))
-		return true;
-
-	Activity realActivity = TranslateActivity(activity);
-
-	// Soldiers need to consider these crouched activities, but not all NPCs should.
-	switch (realActivity)
-	{
-	case ACT_RANGE_AIM_LOW:
-	case ACT_RANGE_AIM_AR2_LOW:
-	case ACT_RANGE_AIM_SMG1_LOW:
-	case ACT_RANGE_AIM_PISTOL_LOW:
-	case ACT_RANGE_ATTACK1_LOW:
-	case ACT_RANGE_ATTACK_AR2_LOW:
-	case ACT_RANGE_ATTACK_SMG1_LOW:
-	case ACT_RANGE_ATTACK_SHOTGUN_LOW:
-	case ACT_RANGE_ATTACK_PISTOL_LOW:
-	case ACT_RANGE_ATTACK2_LOW:
-		return true;
-	}
-
-	return false;
-}
-#endif
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::SetActivity(Activity NewActivity)
-{
-	BaseClass::SetActivity(NewActivity);
-
-#ifndef MAPBASE // CAI_GrenadeUser
-	m_iLastAnimEventHandled = -1;
-#endif
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-NPC_STATE CNPC_Combine::SelectIdealState(void)
-{
-	switch (m_NPCState)
-	{
-	case NPC_STATE_COMBAT:
-	{
-		if (GetEnemy() == NULL)
-		{
-			if (!HasCondition(COND_ENEMY_DEAD))
-			{
-				// Lost track of my enemy. Patrol.
-				SetCondition(COND_COMBINE_SHOULD_PATROL);
-			}
-			return NPC_STATE_ALERT;
-		}
-		else if (HasCondition(COND_ENEMY_DEAD))
-		{
-			AnnounceEnemyKill(GetEnemy());
-		}
-	}
-
-	default:
-	{
-		return BaseClass::SelectIdealState();
-	}
-	}
-
-	return GetIdealState();
-}
-
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::OnBeginMoveAndShoot()
-{
-	if (BaseClass::OnBeginMoveAndShoot())
-	{
-		if (HasStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-			return true; // already have the slot I need
-
-		if (!HasStrategySlotRange(SQUAD_SLOT_GRENADE1, SQUAD_SLOT_ATTACK_OCCLUDER) && OccupyStrategySlotRange(SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK2))
-			return true;
-	}
-	return false;
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-void CNPC_Combine::OnEndMoveAndShoot()
-{
-	VacateStrategySlot();
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-WeaponProficiency_t CNPC_Combine::CalcWeaponProficiency(CBaseCombatWeapon* pWeapon)
-{
-#ifdef MAPBASE
-	if (pWeapon->ClassMatches(gm_isz_class_AR2))
-#else
-	if (FClassnameIs(pWeapon, "weapon_ar2"))
-#endif
-	{
-		if (hl2_episodic.GetBool())
-		{
-			return WEAPON_PROFICIENCY_VERY_GOOD;
-		}
-		else
-		{
-			return WEAPON_PROFICIENCY_GOOD;
-		}
-	}
-#ifdef MAPBASE
-	else if (pWeapon->ClassMatches(gm_isz_class_Shotgun))
-#else
-	else if (FClassnameIs(pWeapon, "weapon_shotgun"))
-#endif
-	{
-#ifndef MAPBASE // Moved so soldiers don't change skin unnaturally and uncontrollably
-		if (m_nSkin != COMBINE_SKIN_SHOTGUNNER)
-		{
-			m_nSkin = COMBINE_SKIN_SHOTGUNNER;
-		}
-#endif
-
-		return WEAPON_PROFICIENCY_PERFECT;
-	}
-#ifdef MAPBASE
-	else if (pWeapon->ClassMatches(gm_isz_class_SMG1))
-#else
-	else if (FClassnameIs(pWeapon, "weapon_smg1"))
-#endif
-	{
-		return WEAPON_PROFICIENCY_GOOD;
-	}
-#ifdef MAPBASE
-	else if (pWeapon->ClassMatches(gm_isz_class_Pistol))
-	{
-		// Mods which need a lower soldier pistol accuracy can either change this value or use proficiency override in Hammer.
-		return WEAPON_PROFICIENCY_VERY_GOOD;
-	}
-#endif
-
-	return BaseClass::CalcWeaponProficiency(pWeapon);
-}
-
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::HasShotgun()
-{
-	if (GetActiveWeapon() && GetActiveWeapon()->m_iClassname == s_iszShotgunClassname)
-	{
-		return true;
-	}
-
-	return false;
-}
-
-//-----------------------------------------------------------------------------
-// Only supports weapons that use clips.
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::ActiveWeaponIsFullyLoaded()
-{
-	CBaseCombatWeapon* pWeapon = GetActiveWeapon();
-
-	if (!pWeapon)
-		return false;
-
-	if (!pWeapon->UsesClipsForAmmo1())
-		return false;
-
-	return (pWeapon->Clip1() >= pWeapon->GetMaxClip1());
+	BaseClass::HandleAnimEvent( pEvent );
 }
 
 
@@ -4129,90 +3505,2799 @@ bool CNPC_Combine::ActiveWeaponIsFullyLoaded()
 // Purpose:  This is a generic function (to be implemented by sub-classes) to
 //			 handle specific interactions between different types of characters
 //			 (For example the barnacle grabbing an NPC)
-// Input  :  The type of interaction, extra info pointer, and who started it
+// Input  :  Constant for the type of interaction
 // Output :	 true  - if sub-class has a response for the interaction
 //			 false - if sub-class has no response
 //-----------------------------------------------------------------------------
-bool CNPC_Combine::HandleInteraction(int interactionType, void* data, CBaseCombatCharacter* sourceEnt)
+bool CNPC_MetroPolice::HandleInteraction(int interactionType, void *data, CBaseCombatCharacter* sourceEnt)
 {
-	if (interactionType == g_interactionTurretStillStanding)
+	if ( interactionType == g_interactionMetrocopStartedStitch )
 	{
-		// A turret that I've kicked recently is still standing 5 seconds later. 
-		if (sourceEnt == GetEnemy())
+		// If anybody in our squad started a stitch, we can't for a little while
+		m_flValidStitchTime = gpGlobals->curtime + random->RandomFloat( METROPOLICE_SQUAD_STITCH_MIN_INTERVAL, METROPOLICE_SQUAD_STITCH_MAX_INTERVAL );
+		return true;
+	}
+
+	if ( interactionType == g_interactionMetrocopIdleChatter )
+	{
+		m_nIdleChatterType = (int)data;
+		return true;
+	}
+
+	if ( interactionType == g_interactionMetrocopClearSentenceQueues )
+	{
+#ifndef METROPOLICE_USES_RESPONSE_SYSTEM
+			m_Sentences.ClearQueue();
+#endif
+			return true;
+	}
+
+	// React to being hit by physics objects
+	if ( interactionType == g_interactionHitByPlayerThrownPhysObj )
+	{
+		// Ignore if I'm in scripted state
+		if ( !IsInAScript() && (m_NPCState != NPC_STATE_SCRIPT) )
 		{
-			// It's still my enemy. Time to grenade it.
-			Vector forward, up;
-			AngleVectors(GetLocalAngles(), &forward, NULL, &up);
-			m_vecTossVelocity = forward * 10;
-			SetCondition(COND_COMBINE_DROP_GRENADE);
-			ClearSchedule("Failed to kick over turret");
+			SetCondition( COND_METROPOLICE_PHYSOBJECT_ASSAULT );
+		}
+		else
+		{
+			AdministerJustice();
+		}
+
+		// See if the object is the cupcop can. If so, fire the output (for x360 achievement)
+		CBaseProp *pProp = (CBaseProp*)data;
+		if( pProp != NULL )
+		{
+#ifdef MAPBASE
+			if( pProp->NameMatches("cupcop_can") )
+				m_OnCupCopped.FireOutput( sourceEnt, this );
+
+			m_OnHitByPhysicsObject.Set(pProp, sourceEnt, this);
+#else
+			if( pProp->NameMatches("cupcop_can") )
+				m_OnCupCopped.FireOutput( this, NULL );
+#endif
+		}
+
+		return true;
+	}
+
+	return BaseClass::HandleInteraction( interactionType, data, sourceEnt );
+}
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+Activity CNPC_MetroPolice::NPC_TranslateActivity( Activity newActivity )
+{
+	if( IsOnFire() && newActivity == ACT_RUN )
+	{
+		return ACT_RUN_ON_FIRE;
+	}
+
+	// If we're shoving, see if we should be more forceful in doing so
+	if ( newActivity == ACT_PUSH_PLAYER )
+	{
+#ifdef MAPBASE
+		if ( m_nNumWarnings >= METROPOLICE_MAX_WARNINGS && Weapon_TranslateActivity( ACT_MELEE_ATTACK1, NULL ) == ACT_MELEE_ATTACK_SWING )
+#else
+		if ( m_nNumWarnings >= METROPOLICE_MAX_WARNINGS )
+#endif
+			return ACT_MELEE_ATTACK1;
+	}
+
+	newActivity = BaseClass::NPC_TranslateActivity( newActivity );
+
+	// This will put him into an angry idle, which will then be translated
+	// by the weapon to the appropriate type. 
+	if ( m_fWeaponDrawn && newActivity == ACT_IDLE && ( GetState() == NPC_STATE_COMBAT || BatonActive() ) )
+	{
+		newActivity = ACT_IDLE_ANGRY;
+	}
+
+#ifdef MAPBASE
+	if (newActivity == ACT_RANGE_ATTACK2) 
+	{
+		return ACT_COMBINE_THROW_GRENADE;
+	}
+#endif
+
+	return newActivity;
+}
+
+#ifdef MAPBASE
+Activity CNPC_MetroPolice::Weapon_TranslateActivity( Activity baseAct, bool *pRequired )
+{
+	Activity translated = BaseClass::Weapon_TranslateActivity(baseAct, pRequired);
+
+	if (!m_fWeaponDrawn)
+	{
+		// If our pistol is holstered, don't act like we have one in our hands.
+		switch (translated)
+		{
+			case ACT_WALK_PISTOL:	return ACT_WALK;
+			case ACT_RUN_PISTOL:	return ACT_RUN;
+			case ACT_IDLE_PISTOL:	return ACT_IDLE;
+		}
+	}
+
+	return translated;
+}
+
+int CNPC_MetroPolice::UnholsterWeapon()
+{
+#if 0
+	if (!m_fWeaponDrawn && (!IsCurSchedule(SCHED_METROPOLICE_DRAW_PISTOL)))
+		SetSchedule(SCHED_METROPOLICE_DRAW_PISTOL);
+
+	return -1;
+#else
+	// Remain compatible with the original behavior
+	if (IsCurSchedule(SCHED_METROPOLICE_DRAW_PISTOL))
+		return -1;
+	else if (!m_fWeaponDrawn)
+	{
+		SetSchedule(SCHED_METROPOLICE_DRAW_PISTOL);
+		return -1;
+	}
+
+	return BaseClass::UnholsterWeapon();
+#endif
+}
+
+void CNPC_MetroPolice::OnChangeRunningBehavior( CAI_BehaviorBase *pOldBehavior,  CAI_BehaviorBase *pNewBehavior )
+{
+	BaseClass::OnChangeRunningBehavior( pOldBehavior,  pNewBehavior );
+
+	// Fix the npc_metropolice using an invisible gun
+	if (!m_fWeaponDrawn)
+	{
+		// We can't just stop and draw, so fall back to gesture unholstering.
+		// Our implementation of UnholsterWeapon() just handles stopping and drawing, which we can skip in this case.
+		m_fWeaponDrawn = true;
+		BaseClass::UnholsterWeapon();
+	}
+}
+#endif
+
+//-----------------------------------------------------------------------------
+// Purpose: Makes the held manhack solid
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::ReleaseManhack( void )
+{
+	Assert( m_hManhack );
+
+	// Make us physical
+	m_hManhack->RemoveSpawnFlags( SF_MANHACK_CARRIED );
+	m_hManhack->CreateVPhysics();
+
+	// Release us
+	m_hManhack->RemoveSolidFlags( FSOLID_NOT_SOLID );
+	m_hManhack->SetMoveType( MOVETYPE_VPHYSICS );
+	m_hManhack->SetParent( NULL );
+
+	// Make us active
+	m_hManhack->RemoveSpawnFlags( SF_NPC_WAIT_FOR_SCRIPT );
+	m_hManhack->ClearSchedule( "Manhack released by metropolice" );
+
+#ifdef MAPBASE
+	// FSOLID_COLLIDE_WITH_OWNER allows us to be remembered as the manhack's owner without making us invulnerable to it
+	m_hManhack->SetOwnerEntity( this );
+	m_hManhack->AddSolidFlags( FSOLID_COLLIDE_WITH_OWNER );
+#endif
+	
+	// Start him with knowledge of our current enemy
+	if ( GetEnemy() )
+	{
+		m_hManhack->SetEnemy( GetEnemy() );
+		m_hManhack->SetState( NPC_STATE_COMBAT );
+
+		m_hManhack->UpdateEnemyMemory( GetEnemy(), GetEnemy()->GetAbsOrigin() );
+	}
+
+	// Place him into our squad so we can communicate
+	if ( m_pSquad )
+	{
+		m_pSquad->AddToSquad( m_hManhack );
+	}
+}
+
+//-----------------------------------------------------------------------------
+// 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::Event_Killed( const CTakeDamageInfo &info )
+{
+	// Release the manhack if we're in the middle of deploying him
+	if ( m_hManhack && m_hManhack->IsAlive() )
+	{
+		ReleaseManhack();
+		m_hManhack = NULL;
+	}
+
+	CBasePlayer *pPlayer = ToBasePlayer( info.GetAttacker() );
+
+	if ( pPlayer != NULL )
+	{
+		CHalfLife2 *pHL2GameRules = static_cast<CHalfLife2 *>(g_pGameRules);
+
+		// Attempt to drop health
+		if ( pHL2GameRules->NPC_ShouldDropHealth( pPlayer ) )
+		{
+			DropItem( "item_healthvial", WorldSpaceCenter()+RandomVector(-4,4), RandomAngle(0,360) );
+			pHL2GameRules->NPC_DroppedHealth();
+		}
+
+#ifdef MAPBASE
+		// Drop grenades if we should
+		DropGrenadeItemsOnDeath( info, pPlayer );
+#endif
+	}
+
+	BaseClass::Event_Killed( info );
+}
+
+//-----------------------------------------------------------------------------
+// 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::Event_KilledOther( CBaseEntity *pVictim, const CTakeDamageInfo &info )
+{
+	BaseClass::Event_KilledOther( pVictim, info );
+
+#ifdef MAPBASE // Moved from OnScheduleChange()
+	if ( pVictim && (pVictim->IsPlayer() || pVictim->IsNPC()) )
+	{
+		AnnounceEnemyKill( pVictim );
+	}
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// Try to enter a slot where we shoot a pistol 
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::TryToEnterPistolSlot( int nSquadSlot )
+{
+	// This logic here will not allow us to occupy the a squad slot
+	// too soon after we already were in it.
+	if ( ( m_LastShootSlot != nSquadSlot || !m_TimeYieldShootSlot.Expired() ) &&
+			OccupyStrategySlot( nSquadSlot ) )
+	{
+		if ( m_LastShootSlot != nSquadSlot )
+		{
+			m_TimeYieldShootSlot.Reset();
+			m_LastShootSlot = nSquadSlot;
 		}
 		return true;
 	}
 
-	return BaseClass::HandleInteraction(interactionType, data, sourceEnt);
+	return false;
 }
 
+
 //-----------------------------------------------------------------------------
-//
+// Combat schedule selection 
 //-----------------------------------------------------------------------------
-const char* CNPC_Combine::GetSquadSlotDebugName(int iSquadSlot)
+int CNPC_MetroPolice::SelectRangeAttackSchedule()
 {
-	switch (iSquadSlot)
+	if ( HasSpawnFlags( SF_METROPOLICE_ALWAYS_STITCH ) )
 	{
-	case SQUAD_SLOT_GRENADE1:			return "SQUAD_SLOT_GRENADE1";
-		break;
-	case SQUAD_SLOT_GRENADE2:			return "SQUAD_SLOT_GRENADE2";
-		break;
-	case SQUAD_SLOT_ATTACK_OCCLUDER:	return "SQUAD_SLOT_ATTACK_OCCLUDER";
-		break;
-	case SQUAD_SLOT_OVERWATCH:			return "SQUAD_SLOT_OVERWATCH";
-		break;
+		int nSched = SelectMoveToLedgeSchedule();
+		if ( nSched != SCHED_NONE )
+			return nSched;
 	}
 
-	return BaseClass::GetSquadSlotDebugName(iSquadSlot);
-}
+	// Range attack if we're able
+	if( TryToEnterPistolSlot( SQUAD_SLOT_ATTACK1 ) || TryToEnterPistolSlot( SQUAD_SLOT_ATTACK12 ))
+		return SCHED_RANGE_ATTACK1;
+	
+	// We're not in a shoot slot... so we've allowed someone else to grab it
+	m_LastShootSlot = SQUAD_SLOT_NONE;
 
-//-----------------------------------------------------------------------------
-//-----------------------------------------------------------------------------
-bool CNPC_Combine::IsUsingTacticalVariant(int variant)
-{
-	if (variant == TACTICAL_VARIANT_PRESSURE_ENEMY && m_iTacticalVariant == TACTICAL_VARIANT_PRESSURE_ENEMY_UNTIL_CLOSE)
+	if( CanDeployManhack() && OccupyStrategySlot( SQUAD_SLOT_POLICE_DEPLOY_MANHACK ) )
 	{
-		// Essentially, fib. Just say that we are a 'pressure enemy' soldier.
-		return true;
+		return SCHED_METROPOLICE_DEPLOY_MANHACK;
 	}
 
-	return m_iTacticalVariant == variant;
+#ifdef MAPBASE
+	// Throw a grenade if not allowed to engage with weapon.
+	if ( CanGrenadeEnemy() )
+	{
+		if ( OccupyStrategySlot( SQUAD_SLOT_SPECIAL_ATTACK ) )
+		{
+			return SCHED_METROPOLICE_RANGE_ATTACK2;
+		}
+	}
+#endif
+
+	return SCHED_METROPOLICE_ADVANCE;
+}
+
+
+//-----------------------------------------------------------------------------
+// How many squad members are trying to arrest the player?
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SquadArrestCount()
+{
+	int nCount = 0;
+
+	AISquadIter_t iter;
+	CAI_BaseNPC *pSquadmate = m_pSquad->GetFirstMember( &iter );
+	while ( pSquadmate )
+	{
+		if ( pSquadmate->IsCurSchedule(	SCHED_METROPOLICE_ARREST_ENEMY ) ||
+			pSquadmate->IsCurSchedule( SCHED_METROPOLICE_WARN_AND_ARREST_ENEMY ) )
+		{
+			++nCount;
+		}
+
+		pSquadmate = m_pSquad->GetNextMember( &iter );
+	}
+
+	return nCount;
+}
+
+
+//-----------------------------------------------------------------------------
+// Arrest schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectScheduleArrestEnemy()
+{
+	if ( !HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) || !IsInSquad() )
+		return SCHED_NONE;
+
+	if ( !HasCondition( COND_SEE_ENEMY ) )
+		return SCHED_NONE;
+
+	if ( !m_fWeaponDrawn )
+		return SCHED_METROPOLICE_DRAW_PISTOL;
+
+	// First guy that sees the enemy will tell him to freeze
+	if ( OccupyStrategySlot( SQUAD_SLOT_POLICE_ARREST_ENEMY ) )
+		return SCHED_METROPOLICE_WARN_AND_ARREST_ENEMY;
+
+	// Squad members 1 -> n will simply gain a line of sight
+	return SCHED_METROPOLICE_ARREST_ENEMY;
+}
+
+
+//-----------------------------------------------------------------------------
+// Combat schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectScheduleNewEnemy()
+{
+	int nSched = SelectScheduleArrestEnemy();
+	if ( nSched != SCHED_NONE )
+		return nSched;
+
+	if ( HasCondition( COND_NEW_ENEMY ) )
+	{
+		m_flNextLedgeCheckTime = gpGlobals->curtime;
+
+		if( CanDeployManhack() && OccupyStrategySlot( SQUAD_SLOT_POLICE_DEPLOY_MANHACK ) )
+			return SCHED_METROPOLICE_DEPLOY_MANHACK;
+	}
+
+	if ( !m_fWeaponDrawn )
+		return SCHED_METROPOLICE_DRAW_PISTOL;
+
+	// Switch our baton on, if it's not already
+	if ( HasBaton() && BatonActive() == false && IsCurSchedule( SCHED_METROPOLICE_ACTIVATE_BATON ) == false )
+	{
+		SetTarget( GetEnemy() );
+		SetBatonState( true );
+		m_flBatonDebounceTime = gpGlobals->curtime + random->RandomFloat( 2.5f, 4.0f );
+		return SCHED_METROPOLICE_ACTIVATE_BATON;
+	}
+
+	return SCHED_NONE;
+}
+
+
+//-----------------------------------------------------------------------------
+// Sound investigation 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectScheduleInvestigateSound()
+{
+	// SEE_ENEMY is set if LOS is available *and* we're looking the right way
+	// Don't investigate if the player's not a criminal.
+	if ( PlayerIsCriminal() && !HasCondition( COND_SEE_ENEMY ) )
+	{
+		if ( HasCondition( COND_HEAR_COMBAT ) || HasCondition( COND_HEAR_PLAYER ) )
+		{
+			if ( m_pSquad && OccupyStrategySlot( SQUAD_SLOT_INVESTIGATE_SOUND ) )
+			{
+				return SCHED_METROPOLICE_INVESTIGATE_SOUND;
+			}
+		}
+	}
+
+	return SCHED_NONE;
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::OnObstructionPreSteer( AILocalMoveGoal_t *pMoveGoal, float distClear, AIMoveResult_t *pResult )
+{
+	if ( pMoveGoal->directTrace.pObstruction )
+	{
+		// Is it a physics prop? Store it off as the last thing to block me
+		CPhysicsProp *pProp = dynamic_cast<CPhysicsProp*>( pMoveGoal->directTrace.pObstruction );
+		if ( pProp && pProp->GetHealth() )
+		{
+			m_hBlockingProp = pProp;
+		}
+		else
+		{
+			m_hBlockingProp = NULL;
+		}
+	}
+
+	return BaseClass::OnObstructionPreSteer( pMoveGoal, distClear, pResult );
 }
 
 //-----------------------------------------------------------------------------
-// For the purpose of determining whether to use a pathfinding variant, this
-// function determines whether the current schedule is a schedule that 
-// 'approaches' the enemy. 
+// Combat schedule selection 
 //-----------------------------------------------------------------------------
-bool CNPC_Combine::IsRunningApproachEnemySchedule()
+int CNPC_MetroPolice::SelectScheduleNoDirectEnemy()
 {
-	if (IsCurSchedule(SCHED_CHASE_ENEMY))
-		return true;
+	// If you can't attack, but you can deploy a manhack, do it!
+	if( CanDeployManhack() && OccupyStrategySlot( SQUAD_SLOT_POLICE_DEPLOY_MANHACK ) )
+		return SCHED_METROPOLICE_DEPLOY_MANHACK;
 
-	if (IsCurSchedule(SCHED_ESTABLISH_LINE_OF_FIRE))
-		return true;
+	// If you can't attack, but you have a baton & there's a physics object in front of you, swat it
+	if ( m_hBlockingProp && HasBaton() )
+	{
+		SetTarget( m_hBlockingProp );
+		m_hBlockingProp = NULL;
+		return SCHED_METROPOLICE_SMASH_PROP;
+	}
 
-	if (IsCurSchedule(SCHED_COMBINE_PRESS_ATTACK, false))
+#ifdef MAPBASE
+	// If you see your enemy and you're still arming yourself, wait and don't just charge in
+	// (if your weapon is holstered, you're probably about to arm yourself)
+	if ( HasCondition( COND_SEE_ENEMY ) && GetWeapon(0) && (IsWeaponHolstered() || FindGestureLayer( TranslateActivity( ACT_ARM ) ) != -1) )
+	{
+		return SCHED_COMBAT_FACE;
+	}
+#endif
+
+	return SCHED_METROPOLICE_CHASE_ENEMY;
+}
+
+
+//-----------------------------------------------------------------------------
+// Combat schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectCombatSchedule()
+{
+	// Announce a new enemy
+	if ( HasCondition( COND_NEW_ENEMY ) )
+	{
+		AnnounceEnemyType( GetEnemy() );
+	}
+
+	int nResult = SelectScheduleNewEnemy();
+	if ( nResult != SCHED_NONE )
+		return nResult;
+
+	if( !m_fWeaponDrawn )
+	{
+		return SCHED_METROPOLICE_DRAW_PISTOL;
+	}
+
+	if (!HasBaton() && ((float)m_nRecentDamage / (float)GetMaxHealth()) > RECENT_DAMAGE_THRESHOLD)
+	{
+		m_nRecentDamage = 0;
+		m_flRecentDamageTime = 0;
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+		SpeakIfAllowed(TLK_COP_COVER_HEAVY_DAMAGE, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL);
+#else
+		m_Sentences.Speak( "METROPOLICE_COVER_HEAVY_DAMAGE", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+#endif
+
+		return SCHED_TAKE_COVER_FROM_ENEMY;
+	}
+
+	if ( HasCondition( COND_CAN_RANGE_ATTACK1 ) )
+	{
+		if ( !GetShotRegulator()->IsInRestInterval() )
+			return SelectRangeAttackSchedule();
+		else
+			return SCHED_METROPOLICE_ADVANCE;
+	}
+
+	if ( HasCondition( COND_CAN_MELEE_ATTACK1 ) )
+	{
+		if ( m_BatonSwingTimer.Expired() )
+		{
+			// Stop chasing the player now that we've taken a swing at them
+			m_flChasePlayerTime = 0;
+			m_BatonSwingTimer.Set( 1.0, 1.75 );
+			return SCHED_MELEE_ATTACK1;
+		}
+		else
+			return SCHED_COMBAT_FACE;
+	}
+
+	if ( HasCondition( COND_TOO_CLOSE_TO_ATTACK ) )
+	{
+		return SCHED_BACK_AWAY_FROM_ENEMY;
+	}
+	
+	if ( HasCondition( COND_LOW_PRIMARY_AMMO ) || HasCondition( COND_NO_PRIMARY_AMMO ) )
+	{
+		AnnounceOutOfAmmo( );
+		return SCHED_HIDE_AND_RELOAD;
+	}
+
+	if ( HasCondition(COND_WEAPON_SIGHT_OCCLUDED) && !HasBaton() )
+	{
+		// If they are hiding behind something that we can destroy, start shooting at it.
+		CBaseEntity *pBlocker = GetEnemyOccluder();
+		if ( pBlocker && pBlocker->GetHealth() > 0 && OccupyStrategySlotRange( SQUAD_SLOT_POLICE_ATTACK_OCCLUDER1, SQUAD_SLOT_POLICE_ATTACK_OCCLUDER2 ) )
+		{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+			SpeakIfAllowed(TLK_COP_SHOOTCOVER);
+#else
+			m_Sentences.Speak( "METROPOLICE_SHOOT_COVER" );
+#endif
+			return SCHED_SHOOT_ENEMY_COVER;
+		}
+	}
+
+	if (HasCondition(COND_ENEMY_OCCLUDED))
+	{
+		if ( GetEnemy() && !(GetEnemy()->GetFlags() & FL_NOTARGET) )
+		{
+#ifdef MAPBASE
+			if ( HasGrenades() )
+			{
+				// We don't see our enemy. If it hasn't been long since I last saw him,
+				// and he's pretty close to the last place I saw him, throw a grenade in 
+				// to flush him out. A wee bit of cheating here...
+
+				float flTime;
+				float flDist;
+
+				flTime = gpGlobals->curtime - GetEnemies()->LastTimeSeen( GetEnemy() );
+				flDist = ( GetEnemy()->GetAbsOrigin() - GetEnemies()->LastSeenPosition( GetEnemy() ) ).Length();
+
+				//Msg("Time: %f   Dist: %f\n", flTime, flDist );
+				if ( flTime <= COMBINE_GRENADE_FLUSH_TIME && flDist <= COMBINE_GRENADE_FLUSH_DIST && CanGrenadeEnemy( false ) && OccupyStrategySlot( SQUAD_SLOT_SPECIAL_ATTACK ) )
+				{
+					return SCHED_METROPOLICE_RANGE_ATTACK2;
+				}
+			}
+#endif
+
+			// Charge in and break the enemy's cover!
+			return SCHED_ESTABLISH_LINE_OF_FIRE;
+		}
+	}
+
+	nResult = SelectScheduleNoDirectEnemy();
+	if ( nResult != SCHED_NONE )
+		return nResult;
+
+	return SCHED_NONE;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: This is a bridge between stunstick, NPC and its behavior
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::ShouldKnockOutTarget( CBaseEntity *pTarget )
+{
+	if ( m_PolicingBehavior.IsEnabled() && m_PolicingBehavior.ShouldKnockOutTarget( pTarget ) )
 		return true;
 
 	return false;
 }
 
-bool CNPC_Combine::ShouldPickADeathPose(void)
+//-----------------------------------------------------------------------------
+// Purpose: This is a bridge between stunstick, NPC and its behavior
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::KnockOutTarget( CBaseEntity *pTarget )
+{
+	if ( m_PolicingBehavior.IsEnabled() )
+	{
+		m_PolicingBehavior.KnockOutTarget( pTarget );
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Can me enemy see me? 
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::CanEnemySeeMe( )
+{
+	if ( GetEnemy()->IsPlayer() )
+	{
+		if ( static_cast<CBasePlayer*>(GetEnemy())->FInViewCone( this ) )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+
+//-----------------------------------------------------------------------------
+// Choose weights about where we can use particular stitching behaviors 
+//-----------------------------------------------------------------------------
+#define STITCH_MIN_DISTANCE 1000.0f
+#define STITCH_MIN_DISTANCE_SLOW 1250.0f
+
+#define STITCH_AT_CONE	0.866f	// cos(30)
+#define STITCH_AT_CONE_WHEN_VISIBLE_MAX	0.3f	// cos(?)
+#define STITCH_AT_CONE_WHEN_VISIBLE_MIN	0.707f	// cos(45)
+#define STITCH_AT_COS_MIN_SPIN_ANGLE	0.2f
+
+float CNPC_MetroPolice::StitchAtWeight( float flDist, float flSpeed, float flDot, float flReactionTime, const Vector &vecTargetToGun )
+{
+	// Can't do an 'attacking' stitch if it's too soon
+	if ( m_flValidStitchTime > gpGlobals->curtime )
+		return 0.0f;
+
+	// No squad slots? no way.
+	if( IsStrategySlotRangeOccupied( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) )
+		return false;
+
+	// Don't do it if the player doesn't have enough time to react
+	if ( flDist < STITCH_MIN_DISTANCE )
+		return 0.0f;
+
+	// Don't do it if the player is farther but really slow
+	if ( ( flDist < STITCH_MIN_DISTANCE_SLOW ) && ( flSpeed < 150.0f ) )
+		return 0.0f;
+
+	// Does the predicted stitch position cross the plane from me to the target's initial position?
+	// If so, it'll look really dumb. Disallow that.
+	Vector vecGunToPredictedTarget, vecShootAtVel;
+	PredictShootTargetPosition( flReactionTime, 0.0f, 0.0f, &vecGunToPredictedTarget, &vecShootAtVel );
+	vecGunToPredictedTarget -= Weapon_ShootPosition();
+	vecGunToPredictedTarget.z = 0.0f;
+	VectorNormalize( vecGunToPredictedTarget );
+
+	Vector2D vecGunToTarget;
+	Vector2DMultiply( vecTargetToGun.AsVector2D(), -1.0f, vecGunToTarget );
+	Vector2DNormalize( vecGunToTarget );
+	if ( DotProduct2D( vecGunToTarget, vecGunToPredictedTarget.AsVector2D() ) <= STITCH_AT_COS_MIN_SPIN_ANGLE )
+		return 0.0f;
+
+	// If the cop is in the view cone, then up the cone in which the stitch will occur 
+	float flConeAngle = STITCH_AT_CONE;
+	if ( CanEnemySeeMe() )
+	{
+		flDist = clamp( flDist, 1500.0f, 2500.0f );
+		flConeAngle = RemapVal( flDist, 1500.0f, 2500.0f, STITCH_AT_CONE_WHEN_VISIBLE_MIN, STITCH_AT_CONE_WHEN_VISIBLE_MAX );
+	}
+
+	flDot = clamp( flDot, -1.0f, flConeAngle );
+	return RemapVal( flDot, -1.0f, flConeAngle, 0.5f, 1.0f );
+}
+
+
+#define STITCH_ACROSS_CONE	0.5f	// cos(60)
+
+float CNPC_MetroPolice::StitchAcrossWeight( float flDist, float flSpeed, float flDot, float flReactionTime )
+{
+	return 0.0f;
+
+	// Can't do an 'attacking' stitch if it's too soon
+	if ( m_flValidStitchTime > gpGlobals->curtime )
+		return 0.0f;
+
+	// No squad slots? no way.
+	if( IsStrategySlotRangeOccupied( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) )
+		return 0.0f;
+
+	if ( flDist < STITCH_MIN_DISTANCE )
+		return 0.0f;
+
+	// Don't do it if the player doesn't have enough time to react
+	if ( flDist < flSpeed * flReactionTime )
+		return 0.0f;
+
+	// We want to stitch across if we're within the stitch across cone
+	if ( flDot < STITCH_ACROSS_CONE )
+		return 0.0f;
+
+	return 1.0f;
+}
+
+
+#define STITCH_ALONG_MIN_CONE	0.866f	// cos(30)
+#define STITCH_ALONG_MIN_CONE_WHEN_VISIBLE	0.707f	// cos(45)
+#define STITCH_ALONG_MAX_CONE	-0.4f	//
+#define STITCH_ALONG_MIN_SPEED	300.0f
+
+float CNPC_MetroPolice::StitchAlongSideWeight( float flDist, float flSpeed, float flDot )
+{
+	// No squad slots? no way.
+	if( IsStrategySlotRangeOccupied( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) &&
+		IsStrategySlotRangeOccupied( SQUAD_SLOT_POLICE_COVERING_FIRE1, SQUAD_SLOT_POLICE_COVERING_FIRE2 ) )
+		return 0.0f;
+
+	if ( flDist < (AIM_ALONG_SIDE_LINE_OF_DEATH_DISTANCE + AIM_ALONG_SIDE_STEER_DISTANCE + 100.0f) )
+		return 0.0f;
+
+	if ( flSpeed < STITCH_ALONG_MIN_SPEED )
+		return 0.0f;
+
+	// We want to stitch across if we're within the stitch across cone
+	float flMinConeAngle = STITCH_ALONG_MIN_CONE;
+	bool bCanEnemySeeMe = CanEnemySeeMe( );
+	if ( bCanEnemySeeMe )
+	{
+		flMinConeAngle = STITCH_ALONG_MIN_CONE_WHEN_VISIBLE;
+	}
+
+	if (( flDot > flMinConeAngle ) || ( flDot < STITCH_ALONG_MAX_CONE ))
+		return 0.0f;
+
+	return bCanEnemySeeMe ? 1.0f : 2.0f;
+}
+
+#define STITCH_BEHIND_MIN_CONE	0.0f	// cos(90)
+
+float CNPC_MetroPolice::StitchBehindWeight( float flDist, float flSpeed, float flDot )
+{
+	return 0.0f;
+
+	// No squad slots? no way.
+	if( IsStrategySlotRangeOccupied( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) &&
+		IsStrategySlotRangeOccupied( SQUAD_SLOT_POLICE_COVERING_FIRE1, SQUAD_SLOT_POLICE_COVERING_FIRE2 ) )
+		return 0.0f;
+
+	if ( flDist < AIM_BEHIND_MINIMUM_DISTANCE )
+		return 0.0f;
+
+	// We want to stitch across if we're within the stitch across cone
+	if ( flDot > STITCH_BEHIND_MIN_CONE )
+		return 0.0f;
+
+	// If we're close, reduce the chances of this if we're also slow
+	if ( flDist < STITCH_MIN_DISTANCE )
+	{
+		flSpeed = clamp( flSpeed, 300.0f, 450.0f );
+		float flWeight = RemapVal( flSpeed, 300.0f, 450.0f, 0.0f, 1.0f );
+		return flWeight;
+	}
+
+	return 1.0f;
+}
+
+float CNPC_MetroPolice::StitchTightWeight( float flDist, float flSpeed, const Vector &vecTargetToGun, const Vector &vecVelocity )
+{
+	// No squad slots? no way.
+	if( IsStrategySlotRangeOccupied( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) &&
+		IsStrategySlotRangeOccupied( SQUAD_SLOT_POLICE_COVERING_FIRE1, SQUAD_SLOT_POLICE_COVERING_FIRE2 ) )
+		return 0.0f;
+
+	if ( flDist > STITCH_MIN_DISTANCE )
+	{
+		if ( flDist > 2000.0f )
+			return 0.0f;
+
+		// We can stitch tight if they are close and no other rules apply.
+		return 0.0001f;
+	}
+
+	// If we're heading right at him, them fire it!
+	Vector vecTargetToGunDir = vecTargetToGun;
+	Vector vecVelocityDir = vecVelocity;
+	VectorNormalize( vecTargetToGunDir );
+	VectorNormalize( vecVelocityDir );
+
+	if ( DotProduct( vecTargetToGunDir, vecVelocityDir ) > 0.95f )
+		return 8.0f;
+
+	// If we're on the same level, fire at him!
+	if ( ( fabs(vecTargetToGun.z) < 50.0f ) && ( flDist < STITCH_MIN_DISTANCE ) )
+		return 1.0f;
+
+	flSpeed = clamp( flSpeed, 300.0f, 450.0f );
+	float flWeight = RemapVal( flSpeed, 300.0f, 450.0f, 1.0f, 0.0f );
+	return flWeight;
+}
+
+
+//-----------------------------------------------------------------------------
+// Combat schedule selection 
+//-----------------------------------------------------------------------------
+#define STITCH_REACTION_TIME 2.0f
+#define STITCH_SCHEDULE_COUNT 5
+
+int CNPC_MetroPolice::SelectStitchSchedule()
+{
+	// If the boat is very close to us, we're going to stitch at it
+	// even if the squad slot is full..
+	Vector vecTargetToGun;
+	Vector vecTarget = StitchAimTarget( GetAbsOrigin(), false );
+	VectorSubtract( Weapon_ShootPosition(), vecTarget, vecTargetToGun );
+
+	Vector2D vecTargetToGun2D = vecTargetToGun.AsVector2D();
+	float flDist = Vector2DNormalize( vecTargetToGun2D );
+
+	if ( HasSpawnFlags( SF_METROPOLICE_NO_FAR_STITCH ) )
+	{
+		if ( flDist > 6000.0f )
+			return SCHED_NONE;
+	}
+
+	float flReactionTime = STITCH_REACTION_TIME * sk_metropolice_stitch_reaction.GetFloat();
+	Vector vecVelocity;
+	PredictShootTargetVelocity( flReactionTime, &vecVelocity );
+
+	Vector2D vecVelocity2D = vecVelocity.AsVector2D();
+	float flSpeed = Vector2DNormalize( vecVelocity2D );
+	float flDot = DotProduct2D( vecTargetToGun2D, vecVelocity2D );
+
+	float flWeight[STITCH_SCHEDULE_COUNT];
+	flWeight[0] = StitchAtWeight( flDist, flSpeed, flDot, flReactionTime, vecTargetToGun );
+	flWeight[1] = flWeight[0] + StitchAcrossWeight( flDist, flSpeed, flDot, flReactionTime );
+	flWeight[2] = flWeight[1] + StitchTightWeight( flDist, flSpeed, vecTargetToGun, vecVelocity );
+	flWeight[3] = flWeight[2] + StitchAlongSideWeight( flDist, flSpeed, flDot );
+	flWeight[4] = flWeight[3] + StitchBehindWeight( flDist, flSpeed, flDot );
+
+	if ( flWeight[STITCH_SCHEDULE_COUNT - 1] == 0.0f )
+		return SCHED_NONE;
+
+	int pSched[STITCH_SCHEDULE_COUNT] =
+	{
+		SCHED_METROPOLICE_AIM_STITCH_AT_AIRBOAT,
+		SCHED_METROPOLICE_AIM_STITCH_IN_FRONT_OF_AIRBOAT,
+		SCHED_METROPOLICE_AIM_STITCH_TIGHTLY,
+		SCHED_METROPOLICE_AIM_STITCH_ALONG_SIDE_OF_AIRBOAT,
+		SCHED_METROPOLICE_AIM_STITCH_BEHIND_AIRBOAT,
+	};
+
+	int i;
+	float flRand = random->RandomFloat( 0.0f, flWeight[STITCH_SCHEDULE_COUNT - 1] );
+	for ( i = 0; i < STITCH_SCHEDULE_COUNT; ++i )
+	{
+		if ( flRand <= flWeight[i] )
+			break;
+	}
+
+	// If we're basically a covering activity, take up that slot
+	if ( i >= 3 )
+	{
+		if( OccupyStrategySlotRange( SQUAD_SLOT_POLICE_COVERING_FIRE1, SQUAD_SLOT_POLICE_COVERING_FIRE2 ) )
+		{
+			return pSched[i];
+		}
+	}
+
+	if( OccupyStrategySlotRange( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) )
+	{
+		if ( IsInSquad() && (i < 2) )
+		{
+			GetSquad()->BroadcastInteraction( g_interactionMetrocopStartedStitch, NULL );
+		}
+
+		return pSched[i];
+	}
+
+	return SCHED_NONE;
+}
+
+
+//-----------------------------------------------------------------------------
+// Combat schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectMoveToLedgeSchedule()
+{
+	// Prevent a bunch of unnecessary raycasts.
+	if ( m_flNextLedgeCheckTime > gpGlobals->curtime )
+		return SCHED_NONE;
+
+	// If the NPC is above the airboat (say, on a bridge), make sure he
+	// goes to the closest ledge. (may need a spawnflag for this)
+	if ( (GetAbsOrigin().z - GetShootTarget()->GetAbsOrigin().z) >= 150.0f )
+	{
+		m_flNextLedgeCheckTime = gpGlobals->curtime + 3.0f;
+
+		// We need to be able to shoot downward at a 60 degree angle.
+		Vector vecDelta;
+		VectorSubtract( GetShootTarget()->WorldSpaceCenter(), Weapon_ShootPosition(), vecDelta );
+		vecDelta.z = 0.0f;
+		VectorNormalize( vecDelta );
+
+		// At this point, vecDelta is 45 degrees below horizontal.
+		vecDelta.z = -1;
+		vecDelta *= 100.0f;
+
+		trace_t tr;
+		CTraceFilterWorldOnly traceFilter;
+		UTIL_TraceLine( Weapon_ShootPosition(), Weapon_ShootPosition() + vecDelta, MASK_SOLID, &traceFilter, &tr );
+
+		if (tr.endpos.z >= GetAbsOrigin().z - 25.0f )
+			return SCHED_METROPOLICE_ESTABLISH_STITCH_LINE_OF_FIRE;
+	}
+	
+	return SCHED_NONE;
+}
+
+
+//-----------------------------------------------------------------------------
+// Combat schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectAirboatRangeAttackSchedule()
+{
+	// Move to a ledge, if we need to.
+	int nSched = SelectMoveToLedgeSchedule();
+	if ( nSched != SCHED_NONE )
+		return nSched;
+
+	if ( HasCondition( COND_CAN_RANGE_ATTACK1 ) )
+	{
+		nSched = SelectStitchSchedule();
+		if ( nSched != SCHED_NONE )
+		{
+			m_LastShootSlot = SQUAD_SLOT_NONE;
+			return nSched;
+		}
+	}
+
+	if( CanDeployManhack() && OccupyStrategySlot( SQUAD_SLOT_POLICE_DEPLOY_MANHACK ) )
+	{
+		return SCHED_METROPOLICE_DEPLOY_MANHACK;
+	}
+
+	return SCHED_METROPOLICE_ESTABLISH_LINE_OF_FIRE;
+}
+
+
+//-----------------------------------------------------------------------------
+// Combat schedule selection for when the enemy is in an airboat
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectAirboatCombatSchedule()
+{
+	int nResult = SelectScheduleNewEnemy();
+	if ( nResult != SCHED_NONE )
+		return nResult;
+
+	// We're assuming here that the cops who attack airboats have SMGs
+//	Assert( Weapon_OwnsThisType( "weapon_smg1" ) );
+
+	if ( HasCondition( COND_SEE_ENEMY ) )
+	{
+		return SelectAirboatRangeAttackSchedule();
+	}
+	
+	if ( HasCondition( COND_WEAPON_SIGHT_OCCLUDED ) )
+	{
+		// If they are hiding behind something also attack. Don't bother
+		// shooting the destroyable thing; it'll happen anyways with the SMG
+		CBaseEntity *pBlocker = GetEnemyOccluder();
+		if ( pBlocker && pBlocker->GetHealth() > 0 && OccupyStrategySlotRange( SQUAD_SLOT_POLICE_ATTACK_OCCLUDER1, SQUAD_SLOT_POLICE_ATTACK_OCCLUDER2 ) )
+		{
+			return SelectAirboatRangeAttackSchedule();
+		}
+	}
+
+	nResult = SelectScheduleNoDirectEnemy();
+	if ( nResult != SCHED_NONE )
+		return nResult;
+
+	return SCHED_NONE;
+}
+
+
+#ifdef MAPBASE
+//-----------------------------------------------------------------------------
+// Standoff schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectBehaviorOverrideSchedule()
+{
+	// Announce a new enemy
+	if ( HasCondition( COND_NEW_ENEMY ) )
+	{
+		AnnounceEnemyType( GetEnemy() );
+	}
+
+	int nResult = SelectScheduleNewEnemy();
+	if ( nResult != SCHED_NONE )
+		return nResult;
+
+	if (!HasBaton() && ((float)m_nRecentDamage / (float)GetMaxHealth()) > RECENT_DAMAGE_THRESHOLD)
+	{
+		m_nRecentDamage = 0;
+		m_flRecentDamageTime = 0;
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+		SpeakIfAllowed(TLK_COP_COVER_HEAVY_DAMAGE, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL);
+#else
+		m_Sentences.Speak( "METROPOLICE_COVER_HEAVY_DAMAGE", SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+#endif
+
+		return SCHED_TAKE_COVER_FROM_ENEMY;
+	}
+
+	if ( HasCondition( COND_CAN_RANGE_ATTACK1 ) )
+	{
+		nResult = SelectRangeAttackSchedule();
+		if ( !GetShotRegulator()->IsInRestInterval() && nResult != SCHED_METROPOLICE_ADVANCE && nResult != SCHED_RANGE_ATTACK1 )
+			return nResult;
+	}
+
+	if ( HasCondition( COND_TOO_CLOSE_TO_ATTACK ) )
+	{
+		return SCHED_BACK_AWAY_FROM_ENEMY;
+	}
+	
+	if ( HasCondition( COND_LOW_PRIMARY_AMMO ) || HasCondition( COND_NO_PRIMARY_AMMO ) )
+	{
+		AnnounceOutOfAmmo( );
+		return SCHED_HIDE_AND_RELOAD;
+	}
+
+	if ( HasCondition(COND_WEAPON_SIGHT_OCCLUDED) && !HasBaton() )
+	{
+		// If they are hiding behind something that we can destroy, start shooting at it.
+		CBaseEntity *pBlocker = GetEnemyOccluder();
+		if ( pBlocker && pBlocker->GetHealth() > 0 && OccupyStrategySlotRange( SQUAD_SLOT_POLICE_ATTACK_OCCLUDER1, SQUAD_SLOT_POLICE_ATTACK_OCCLUDER2 ) )
+		{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+			SpeakIfAllowed(TLK_COP_SHOOTCOVER);
+#else
+			m_Sentences.Speak( "METROPOLICE_SHOOT_COVER" );
+#endif
+			return SCHED_SHOOT_ENEMY_COVER;
+		}
+	}
+
+	if (HasCondition(COND_ENEMY_OCCLUDED))
+	{
+		if ( GetEnemy() && !(GetEnemy()->GetFlags() & FL_NOTARGET) )
+		{
+			if ( HasGrenades() )
+			{
+				// We don't see our enemy. If it hasn't been long since I last saw him,
+				// and he's pretty close to the last place I saw him, throw a grenade in 
+				// to flush him out. A wee bit of cheating here...
+
+				float flTime;
+				float flDist;
+
+				flTime = gpGlobals->curtime - GetEnemies()->LastTimeSeen( GetEnemy() );
+				flDist = ( GetEnemy()->GetAbsOrigin() - GetEnemies()->LastSeenPosition( GetEnemy() ) ).Length();
+
+				//Msg("Time: %f   Dist: %f\n", flTime, flDist );
+				if ( flTime <= COMBINE_GRENADE_FLUSH_TIME && flDist <= COMBINE_GRENADE_FLUSH_DIST && CanGrenadeEnemy( false ) && OccupyStrategySlot( SQUAD_SLOT_SPECIAL_ATTACK ) )
+				{
+					return SCHED_METROPOLICE_RANGE_ATTACK2;
+				}
+			}
+		}
+	}
+
+	// If you can't attack, but you can deploy a manhack, do it!
+	if( CanDeployManhack() && OccupyStrategySlot( SQUAD_SLOT_POLICE_DEPLOY_MANHACK ) )
+		return SCHED_METROPOLICE_DEPLOY_MANHACK;
+
+	return SCHED_NONE;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::IsCrouchedActivity( Activity activity )
+{
+	return BaseClass::IsCrouchedActivity( activity );
+}
+
+//-----------------------------------------------------------------------------
+// Standoff schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::CMetroPoliceStandoffBehavior::SelectScheduleAttack()
+{
+	int result = metropolice_new_component_behavior.GetBool() ? GetOuter()->SelectBehaviorOverrideSchedule() : SCHED_NONE;
+	if (result == SCHED_NONE)
+		result = BaseClass::SelectScheduleAttack();
+	return result;
+}
+#endif
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : &info - 
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::IsHeavyDamage( const CTakeDamageInfo &info )
+{
+	// Metropolice considers bullet fire heavy damage
+	if ( info.GetDamageType() & DMG_BULLET )
+		return true;
+
+	return BaseClass::IsHeavyDamage( info );
+}
+
+//-----------------------------------------------------------------------------
+// TraceAttack
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::TraceAttack( const CTakeDamageInfo &info, const Vector &vecDir, trace_t *ptr, CDmgAccumulator *pAccumulator )
+{
+	// This is needed so we can keep track of the direction of the shot
+	// because we're going to use it to choose the flinch animation
+	if ( m_bSimpleCops )
+	{
+		if ( m_takedamage == DAMAGE_YES )
+		{
+			Vector vecLastHitDirection;
+			VectorIRotate( vecDir, EntityToWorldTransform(), vecLastHitDirection );
+
+			// Point *at* the shooter
+			vecLastHitDirection *= -1.0f;
+
+			QAngle lastHitAngles;
+			VectorAngles( vecLastHitDirection, lastHitAngles );
+			m_flLastHitYaw	= lastHitAngles.y;
+		}
+	}
+
+	BaseClass::TraceAttack( info, vecDir, ptr, pAccumulator );
+}
+
+//-----------------------------------------------------------------------------
+// Determines the best type of flinch anim to play.
+//-----------------------------------------------------------------------------
+Activity CNPC_MetroPolice::GetFlinchActivity( bool bHeavyDamage, bool bGesture )
+{
+	if ( !bGesture && m_bSimpleCops )
+	{
+		// Version for getting shot from behind
+		if ( ( m_flLastHitYaw > 90 ) && ( m_flLastHitYaw < 270 ) )
+		{
+			Activity flinchActivity = (Activity)ACT_METROPOLICE_FLINCH_BEHIND;
+			if ( SelectWeightedSequence ( flinchActivity ) != ACTIVITY_NOT_AVAILABLE )
+				return flinchActivity;
+		}
+
+		if ( ( LastHitGroup() == HITGROUP_CHEST ) ||
+			( LastHitGroup() == HITGROUP_LEFTLEG ) ||
+			( LastHitGroup() == HITGROUP_RIGHTLEG ) )
+		{
+			Activity flinchActivity = ACT_FLINCH_STOMACH;
+			if ( SelectWeightedSequence ( ACT_FLINCH_STOMACH ) != ACTIVITY_NOT_AVAILABLE )
+				return flinchActivity;
+		}
+	}
+
+	return BaseClass::GetFlinchActivity( bHeavyDamage, bGesture );
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::PlayFlinchGesture( void )
+{
+	BaseClass::PlayFlinchGesture();
+
+	// To ensure old playtested difficulty stays the same, stop cops shooting for a bit after gesture flinches
+	GetShotRegulator()->FireNoEarlierThan( gpGlobals->curtime + 0.5 );
+}
+
+//-----------------------------------------------------------------------------
+// We're taking cover from danger
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AnnounceHarrassment( void )
+{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+	SpeakIfAllowed(TLK_COP_BACK_UP, SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL);
+#else
+	static const char *pWarnings[3] = 
+	{
+		"METROPOLICE_BACK_UP_A",
+		"METROPOLICE_BACK_UP_B",
+		"METROPOLICE_BACK_UP_C",
+	};
+
+	m_Sentences.Speak( pWarnings[ random->RandomInt( 0, ARRAYSIZE(pWarnings)-1 ) ], SENTENCE_PRIORITY_MEDIUM, SENTENCE_CRITERIA_NORMAL );
+#endif
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::IncrementPlayerCriminalStatus( void )
+{
+	CBasePlayer *pPlayer = UTIL_PlayerByIndex( 1 );
+
+	if ( pPlayer )
+	{
+		AddLookTarget( pPlayer, 0.8f, 5.0f );
+
+		if ( m_nNumWarnings < METROPOLICE_MAX_WARNINGS )
+		{
+			m_nNumWarnings++;
+		}
+
+		if ( m_nNumWarnings >= (METROPOLICE_MAX_WARNINGS-1) )
+		{
+			SetTarget( pPlayer );
+			SetBatonState( true );
+		}
+	}
+
+	m_flBatonDebounceTime = gpGlobals->curtime + random->RandomFloat( 2.0f, 4.0f );
+
+	AnnounceHarrassment();
+
+	m_bKeepFacingPlayer = true;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Output : int
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectShoveSchedule( void )
+{
+	IncrementPlayerCriminalStatus();
+
+	// Stop chasing the player now that we've taken a swing at them
+	m_flChasePlayerTime = 0;
+	return SCHED_METROPOLICE_SHOVE;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Output : float
+//-----------------------------------------------------------------------------
+float CNPC_MetroPolice::GetIdealAccel( void ) const
+{
+	return GetIdealSpeed() * 2.0f;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: Chase after a player who's just pissed us off, and hit him
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::AdministerJustice( void )
+{
+	if ( !AI_IsSinglePlayer() )
+		return;
+
+	// If we're allowed to chase the player, do so. Otherwise, just threaten.
+	if ( !IsInAScript() && (m_NPCState != NPC_STATE_SCRIPT) && HasSpawnFlags( SF_METROPOLICE_ALLOWED_TO_RESPOND ) )
+	{
+		if ( m_vecPreChaseOrigin == vec3_origin )
+		{
+			m_vecPreChaseOrigin = GetAbsOrigin();
+			m_flPreChaseYaw = GetAbsAngles().y;
+		}
+		m_flChasePlayerTime = gpGlobals->curtime + RandomFloat( 3, 7 );
+
+		// Attack the target
+		CBasePlayer *pPlayer = UTIL_PlayerByIndex(1);
+		SetEnemy( pPlayer );
+		SetState( NPC_STATE_COMBAT );
+		UpdateEnemyMemory( pPlayer, pPlayer->GetAbsOrigin() );
+	}
+	else
+	{
+		// Watch the player for a time.
+		m_bKeepFacingPlayer = true;
+
+		// Try and find a nearby cop to administer justice
+		CAI_BaseNPC **ppAIs = g_AI_Manager.AccessAIs();
+		int nAIs = g_AI_Manager.NumAIs();
+		for ( int i = 0; i < nAIs; i++ )
+		{
+			if ( ppAIs[i] == this )
+				continue;
+
+			if ( ppAIs[i]->Classify() == CLASS_METROPOLICE && FClassnameIs( ppAIs[i], "npc_metropolice" ) )
+			{
+				CNPC_MetroPolice *pNPC = assert_cast<CNPC_MetroPolice*>(ppAIs[i]);
+				if ( pNPC->HasSpawnFlags( SF_METROPOLICE_ALLOWED_TO_RESPOND ) )
+				{
+					// Is he within site & range?
+					if ( FVisible(pNPC) && pNPC->FVisible( UTIL_PlayerByIndex(1) ) && 
+						UTIL_DistApprox( WorldSpaceCenter(), pNPC->WorldSpaceCenter() ) < 512 )
+					{
+						pNPC->AdministerJustice();
+						break;
+					}
+				}
+			}
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Schedule selection 
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectSchedule( void )
+{
+	if ( !GetEnemy() && HasCondition( COND_IN_PVS ) && AI_GetSinglePlayer() && !AI_GetSinglePlayer()->IsAlive() )
+	{
+		return SCHED_PATROL_WALK;
+	}
+
+	if ( HasCondition(COND_METROPOLICE_ON_FIRE) )
+	{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+		SpeakIfAllowed(TLK_COP_ON_FIRE, "hurt_by_fire:1", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS);
+#else
+		m_Sentences.Speak( "METROPOLICE_ON_FIRE", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#endif
+		return SCHED_METROPOLICE_BURNING_STAND;
+	}
+
+	// React to being struck by a physics object
+	if ( HasCondition( COND_METROPOLICE_PHYSOBJECT_ASSAULT ) )
+	{
+		ClearCondition( COND_METROPOLICE_PHYSOBJECT_ASSAULT );
+
+		// See which state our player relationship is in
+		if ( PlayerIsCriminal() == false )
+		{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+			SpeakIfAllowed( TLK_COP_HIT_BY_PHYSOBJ, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#else
+			m_Sentences.Speak( "METROPOLICE_HIT_BY_PHYSOBJECT", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#endif
+			m_nNumWarnings = METROPOLICE_MAX_WARNINGS;
+			AdministerJustice();
+		}
+		else if ( GlobalEntity_GetState( "gordon_precriminal" ) == GLOBAL_ON )
+		{
+			// We're not allowed to respond, but warn them
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+			SpeakIfAllowed( TLK_COP_HARASS, SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#else
+			m_Sentences.Speak( "METROPOLICE_IDLE_HARASS_PLAYER", SENTENCE_PRIORITY_INVALID, SENTENCE_CRITERIA_ALWAYS );
+#endif
+		}
+	}
+
+#ifdef MAPBASE
+	if ( m_hForcedGrenadeTarget )
+	{
+		if ( m_flNextGrenadeCheck < gpGlobals->curtime )
+		{
+			Vector vecTarget = m_hForcedGrenadeTarget->WorldSpaceCenter();
+
+			// The fact we have a forced grenade target overrides whether we're marked as "capable".
+			// If we're *only* alt-fire capable, use an energy ball. If not, throw a grenade.
+			if (!IsAltFireCapable() || IsGrenadeCapable())
+			{
+				Vector vecTarget = m_hForcedGrenadeTarget->WorldSpaceCenter();
+				{
+					// If we can, throw a grenade at the target. 
+					// Ignore grenade count / distance / etc
+					if ( CheckCanThrowGrenade( vecTarget ) )
+					{
+						m_hForcedGrenadeTarget = NULL;
+						return SCHED_METROPOLICE_FORCED_GRENADE_THROW;
+					}
+				}
+			}
+			else
+			{
+				if ( FVisible( m_hForcedGrenadeTarget ) )
+				{
+					m_vecAltFireTarget = vecTarget;
+					m_hForcedGrenadeTarget = NULL;
+					return SCHED_METROPOLICE_AR2_ALTFIRE;
+				}
+			}
+		}
+
+		// Can't throw at the target, so lets try moving to somewhere where I can see it
+		if ( !FVisible( m_hForcedGrenadeTarget ) )
+		{
+			return SCHED_METROPOLICE_MOVE_TO_FORCED_GREN_LOS;
+		}
+	}
+#endif
+
+	int nSched = SelectFlinchSchedule();
+	if ( nSched != SCHED_NONE )
+		return nSched;
+
+	if ( HasBaton() )
+	{
+		// See if we're being told to activate our baton
+		if ( m_bShouldActivateBaton && BatonActive() == false && IsCurSchedule( SCHED_METROPOLICE_ACTIVATE_BATON ) == false )
+			return SCHED_METROPOLICE_ACTIVATE_BATON;
+
+		if ( m_bShouldActivateBaton == false && BatonActive() && IsCurSchedule( SCHED_METROPOLICE_DEACTIVATE_BATON ) == false )
+			return SCHED_METROPOLICE_DEACTIVATE_BATON;
+
+		if( metropolice_chase_use_follow.GetBool() )
+		{
+			if( GetEnemy() )
+			{
+				AI_FollowParams_t params;
+				params.formation = AIF_TIGHT;
+				m_FollowBehavior.SetParameters( params );
+				m_FollowBehavior.SetFollowTarget( GetEnemy() );
+			}
+		}
+	}
+
+	// See if the player is in our face (unless we're scripting)
+	if ( PlayerIsCriminal() == false )
+	{
+		if ( !IsInAScript() && (HasCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE ) || m_bPlayerTooClose) )
+		{
+			// Don't hit the player too many times in a row, unless he's trying to push a cop who hasn't moved
+			if ( m_iNumPlayerHits < 3 || m_vecPreChaseOrigin == vec3_origin )
+			{
+				ClearCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+				m_bPlayerTooClose = false;
+				
+				return SelectShoveSchedule();
+			}
+		}
+		else if ( m_iNumPlayerHits )
+		{
+			// If we're not in combat, and we've got a pre-chase origin, move back to it
+			if ( ( m_NPCState != NPC_STATE_COMBAT ) && 
+				 ( m_vecPreChaseOrigin != vec3_origin ) && 
+				 ( m_flChasePlayerTime < gpGlobals->curtime ) )
+			{
+				return SCHED_METROPOLICE_RETURN_TO_PRECHASE;
+			}
+		}
+	}
+
+	// Cower when physics objects are thrown at me
+	if ( HasCondition( COND_HEAR_PHYSICS_DANGER ) )
+	{
+		if ( m_flLastPhysicsFlinchTime + 4.0f <= gpGlobals->curtime )
+		{
+			m_flLastPhysicsFlinchTime = gpGlobals->curtime;
+			return SCHED_FLINCH_PHYSICS;
+		}
+	}
+
+	// Always run for cover from danger sounds
+	if (HasCondition(COND_HEAR_DANGER))
+	{
+		// --- PRE-CONDITION CHECKS ---
+
+		// 1. Cooldown Check: First, check if the ability is on cooldown.
+		if (gpGlobals->curtime < m_flNextGrenadeCatchTime)
+		{
+			// If on cooldown, force the default flee behavior.
+			return SCHED_TAKE_COVER_FROM_BEST_SOUND;
+		}
+
+		// 2. State Check: Next, check if the metropolice is busy reloading.
+		if (GetActivity() == ACT_RELOAD)
+		{
+			// If so, prioritize self-preservation and force the default flee behavior.
+			return SCHED_TAKE_COVER_FROM_BEST_SOUND;
+		}
+
+		// --- DANGER EVALUATION ---
+
+		CSound* pSound = GetBestSound();
+
+		Assert(pSound != NULL);
+		if (pSound && (pSound->m_iType & SOUND_DANGER))
+		{
+			AnnounceTakeCoverFromDanger(pSound);
+
+			// [MODIFICATION] Grenade Kick Logic (Adapted from Combine)
+
+			// 3. Sound Owner Validation: Check if the sound was made by an entity.
+			if (pSound->m_hOwner)
+			{
+				// 4. Type Validation: Ensure the entity is a frag grenade.
+				// strcmp compares two strings. Returns 0 if they are equal.
+				if (strcmp(pSound->m_hOwner->GetClassname(), "npc_grenade_frag") == 0)
+				{
+					// Defines the effective range for the kick ability.
+					const float flAbilityRange = 40.0f; // A little over 1 meter.
+
+					// Calculates the distance between the cop and the grenade.
+					float flDist = GetAbsOrigin().DistTo(pSound->m_hOwner->GetAbsOrigin());
+
+					// 5. Range Validation: Is the grenade close enough to kick?
+					if (flDist <= flAbilityRange)
+					{
+						// If all conditions are met, execute the grenade kick schedule.
+						// Remember to use the exact schedule name you created!
+						return SCHED_METROPOLICE_KICK_GRENADE;
+					}
+				}
+			}
+
+			// --- END OF GRENADE KICK LOGIC ---
+
+			// Fallback Behavior: If any of the above conditions fail (not a grenade, too far away, etc.),
+			// the NPC will simply run for cover.
+			return SCHED_TAKE_COVER_FROM_BEST_SOUND;
+		}
+
+		
+		if (pSound && !HasCondition(COND_SEE_ENEMY) && (pSound->m_iType & (SOUND_PLAYER | SOUND_PLAYER_VEHICLE | SOUND_COMBAT)))
+		{
+			GetMotor()->SetIdealYawToTarget(pSound->GetSoundReactOrigin());
+		}
+	}
+
+	bool bHighHealth = ((float)GetHealth() / (float)GetMaxHealth() > 0.75f);
+
+	// This will cause the cops to run backwards + shoot at the same time
+	if ( !bHighHealth && !HasBaton() )
+	{
+#ifdef MAPBASE
+		// Don't do this with low-capacity weapons or weapons which don't use clips
+		if ( GetActiveWeapon() && GetActiveWeapon()->UsesClipsForAmmo1() && GetActiveWeapon()->GetMaxClip1() > 10 && (GetActiveWeapon()->m_iClip1 <= 5) )
+#else
+		if ( GetActiveWeapon() && (GetActiveWeapon()->m_iClip1 <= 5) )
+#endif
+		{
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+			SpeakIfAllowed( TLK_COP_LOWAMMO );
+#else
+			m_Sentences.Speak( "METROPOLICE_COVER_LOW_AMMO" );
+#endif
+			return SCHED_HIDE_AND_RELOAD;
+		}
+	}
+
+	if( HasCondition( COND_NO_PRIMARY_AMMO ) )
+	{
+		if ( bHighHealth )
+			return SCHED_RELOAD;
+
+		AnnounceOutOfAmmo( );
+		return SCHED_HIDE_AND_RELOAD;
+	}
+
+	// If we're clubbing someone who threw something at us. chase them
+	if ( m_NPCState == NPC_STATE_COMBAT && m_flChasePlayerTime > gpGlobals->curtime )
+		return SCHED_CHASE_ENEMY;
+
+	if ( !BehaviorSelectSchedule() )
+	{
+		// If we've warned the player at all, watch him like a hawk
+		if ( m_bKeepFacingPlayer && !PlayerIsCriminal() )
+			return SCHED_TARGET_FACE;
+
+		switch( m_NPCState )
+		{
+		case NPC_STATE_IDLE:
+			{
+				nSched = SelectScheduleInvestigateSound();
+				if ( nSched != SCHED_NONE )
+					return nSched;
+				break;
+			}
+
+		case NPC_STATE_ALERT:
+			{
+				nSched = SelectScheduleInvestigateSound();
+				if ( nSched != SCHED_NONE )
+					return nSched;
+			}
+			break;
+
+		case NPC_STATE_COMBAT:
+#ifdef MAPBASE
+			if (!IsEnemyInAnAirboat() || !GetActiveWeapon() || !EntIsClass(GetActiveWeapon(), gm_isz_class_SMG1))
+#else
+			if (!IsEnemyInAnAirboat() || !Weapon_OwnsThisType( "weapon_smg1" ) )
+#endif
+			{
+				int nResult = SelectCombatSchedule();
+				if ( nResult != SCHED_NONE )
+					return nResult;
+			}
+			else
+			{
+				int nResult = SelectAirboatCombatSchedule();
+				if ( nResult != SCHED_NONE )
+					return nResult;
+			}
+			break;
+		}
+	}
+
+	// If we're not in combat, and we've got a pre-chase origin, move back to it
+	if ( ( m_NPCState != NPC_STATE_COMBAT ) && 
+		 ( m_vecPreChaseOrigin != vec3_origin ) && 
+		 ( m_flChasePlayerTime < gpGlobals->curtime ) )
+	{
+		return SCHED_METROPOLICE_RETURN_TO_PRECHASE;
+	}
+
+	return BaseClass::SelectSchedule();
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : failedSchedule - 
+//			failedTask - 
+//			taskFailCode - 
+// Output : int
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::SelectFailSchedule( int failedSchedule, int failedTask, AI_TaskFailureCode_t taskFailCode )
+{
+	if ( failedSchedule == SCHED_METROPOLICE_CHASE_ENEMY )
+	{
+		return SCHED_METROPOLICE_ESTABLISH_LINE_OF_FIRE;
+	}
+
+	return BaseClass::SelectFailSchedule( failedSchedule, failedTask, taskFailCode );
+}
+
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::TranslateSchedule( int scheduleType )
+{
+	switch( scheduleType )
+	{
+	case SCHED_ALERT_FACE_BESTSOUND:
+		if ( !IsCurSchedule( SCHED_METROPOLICE_ALERT_FACE_BESTSOUND, false ) )
+		{
+			return SCHED_METROPOLICE_ALERT_FACE_BESTSOUND;
+		}
+		return SCHED_ALERT_FACE_BESTSOUND;
+
+	case SCHED_CHASE_ENEMY:
+		
+		if ( !IsRunningBehavior() )
+		{
+			return SCHED_METROPOLICE_CHASE_ENEMY;
+		}
+		
+		break;
+
+	case SCHED_ESTABLISH_LINE_OF_FIRE:
+	case SCHED_METROPOLICE_ESTABLISH_LINE_OF_FIRE:
+		if ( IsEnemyInAnAirboat() )
+		{
+			int nSched = SelectMoveToLedgeSchedule();
+			if ( nSched != SCHED_NONE )
+				return nSched;
+		}
+#ifdef MAPBASE
+		if ( CanAltFireEnemy(false) && OccupyStrategySlot(SQUAD_SLOT_SPECIAL_ATTACK) )
+		{
+			// If this metrocop has the balls to alt-fire the enemy's last known position,
+			// do so!
+			return SCHED_METROPOLICE_AR2_ALTFIRE;
+		}
+#endif
+		return SCHED_METROPOLICE_ESTABLISH_LINE_OF_FIRE;		
+		
+	case SCHED_WAKE_ANGRY:
+		return SCHED_METROPOLICE_WAKE_ANGRY;
+
+	case SCHED_FAIL_TAKE_COVER:
+		
+		if ( HasCondition( COND_CAN_RANGE_ATTACK1 ) )
+		{
+			// Must be able to shoot now
+			if( TryToEnterPistolSlot( SQUAD_SLOT_ATTACK1 ) || TryToEnterPistolSlot( SQUAD_SLOT_ATTACK12 ) )
+				return SCHED_RANGE_ATTACK1;
+		}
+
+		if ( HasCondition( COND_NO_PRIMARY_AMMO ) )
+			return SCHED_RELOAD;
+		return SCHED_RUN_RANDOM;
+
+	case SCHED_RANGE_ATTACK1:
+		Assert( !HasCondition( COND_NO_PRIMARY_AMMO ) );
+
+		if( !m_fWeaponDrawn )
+		{
+			return SCHED_METROPOLICE_DRAW_PISTOL;
+		}
+
+#ifdef MAPBASE
+		if (CanAltFireEnemy( true ) && OccupyStrategySlot( SQUAD_SLOT_SPECIAL_ATTACK ))
+		{
+			// Since I'm holding this squadslot, no one else can try right now. If I die before the shot 
+			// goes off, I won't have affected anyone else's ability to use this attack at their nearest
+			// convenience.
+			return SCHED_METROPOLICE_AR2_ALTFIRE;
+		}
+#endif
+
+#ifdef MAPBASE
+		if (GetActiveWeapon() && EntIsClass(GetActiveWeapon(), gm_isz_class_SMG1))
+#else
+		if( Weapon_OwnsThisType( "weapon_smg1" ) )
+#endif
+		{
+			if ( IsEnemyInAnAirboat() )
+			{
+				int nSched = SelectStitchSchedule();
+				if ( nSched != SCHED_NONE )
+					return nSched;
+			}
+
+			if ( ShouldAttemptToStitch() )
+			{
+				return SCHED_METROPOLICE_SMG_BURST_ATTACK;
+			}
+			else
+			{
+				return SCHED_METROPOLICE_SMG_NORMAL_ATTACK;
+			}
+		}
+		break;
+#ifdef MAPBASE
+	case SCHED_TAKE_COVER_FROM_ENEMY:
+		{
+			if ( m_pSquad )
+			{
+				// Have to explicitly check innate range attack condition as may have weapon with range attack 2
+				if (	g_pGameRules->IsSkillLevel( SKILL_HARD )	&& 
+					HasCondition(COND_CAN_RANGE_ATTACK2)		&&
+					OccupyStrategySlot( SQUAD_SLOT_SPECIAL_ATTACK ) )
+				{
+	#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+					SpeakIfAllowed( TLK_COP_THROWGRENADE );
+	#else
+					m_Sentences.Speak( "COMBINE_THROW_GRENADE" );
+	#endif
+					return SCHED_METROPOLICE_RANGE_ATTACK2;
+				}
+			}
+		}
+		break;
+	case SCHED_HIDE_AND_RELOAD:
+		{
+			if( CanGrenadeEnemy() && OccupyStrategySlot( SQUAD_SLOT_SPECIAL_ATTACK ) && random->RandomInt( 0, 100 ) < 20 )
+			{
+				// If I COULD throw a grenade and I need to reload, 20% chance I'll throw a grenade before I hide to reload.
+				return SCHED_METROPOLICE_RANGE_ATTACK2;
+			}
+		}
+		break;
+#endif
+	case SCHED_METROPOLICE_ADVANCE:
+		if ( m_NextChargeTimer.Expired() && metropolice_charge.GetBool() )
+		{	
+#ifdef MAPBASE
+			if (GetActiveWeapon() && EntIsClass(GetActiveWeapon(), gm_isz_class_Pistol))
+#else
+			if ( Weapon_OwnsThisType( "weapon_pistol" ) )
+#endif
+			{
+				if (  GetEnemy() && GetEnemy()->GetAbsOrigin().DistToSqr( GetAbsOrigin() ) > 300*300 )
+				{
+					if ( OccupyStrategySlot( SQUAD_SLOT_POLICE_CHARGE_ENEMY ) )
+					{
+						m_NextChargeTimer.Set( 3, 7 );
+						return SCHED_METROPOLICE_CHARGE;
+					}
+				}
+			}
+			else
+			{
+				m_NextChargeTimer.Set( 99999 );
+			}
+		}
+		break;
+	}
+
+
+	return BaseClass::TranslateSchedule( scheduleType );
+}
+
+
+//-----------------------------------------------------------------------------
+// Can't move and shoot when the enemy is an airboat
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::ShouldMoveAndShoot()
+{
+	if ( HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) )
+		return false;
+
+	if ( ShouldAttemptToStitch() )
+		return false;
+
+	return BaseClass::ShouldMoveAndShoot();
+}
+
+
+//-----------------------------------------------------------------------------
+// Only move and shoot when attacking
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::OnBeginMoveAndShoot()
+{
+	if ( BaseClass::OnBeginMoveAndShoot() )
+	{
+		if( HasStrategySlotRange( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) )
+			return true; // already have the slot I need
+
+		if( OccupyStrategySlotRange( SQUAD_SLOT_ATTACK1, SQUAD_SLOT_ATTACK12 ) )
+			return true;
+	}
+
+	return false;
+}
+
+//-----------------------------------------------------------------------------
+// Only move and shoot when attacking
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::OnEndMoveAndShoot()
+{
+	VacateStrategySlot();
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : pTask - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::StartTask(const Task_t* pTask)
+{
+	switch (pTask->iTask)
+	{
+	case TASK_METROPOLICE_FACE_GRENADE:	// [MODIFICATION] An instantaneous task that enables a 'turbo turn' to quickly face the memorized grenade.
+	{
+		DevMsg("CP StartTask: Iniciando TASK_METROPOLICE_FACE_GRENADE (Turbo Turn LIGADO).\n");	// Logs a debug message to the developer console.
+
+		m_bForceFastTurn = true;	// Enables the high-speed 'turbo' turn for the NPC.
+		TaskComplete();				// Immediately marks this task as complete.
+		break;						
+	}
+
+	case TASK_METROPOLICE_MEMORIZE_GRENADE: // [MODIFICATION] An instantaneous task that identifies and 'memorizes' the grenade from a danger sound.
+	{
+		DevMsg("CP StartTask: Iniciando TASK_METROPOLICE_MEMORIZE_GRENADE.\n");	// Logs a debug message indicating the task has started.
+
+		CSound* pSound = GetBestSound();	// Retrieves the most prominent sound the NPC can hear.
+		if (pSound && pSound->m_hOwner)		// Checks if the sound exists and has a valid owner entity (the grenade).
+		{
+			m_hPulledObject = pSound->m_hOwner;	// Stores a handle to the grenade entity for later use.
+
+			DevMsg("CP StartTask: Granada (%s) memorizada com sucesso.\n", m_hPulledObject->GetClassname()); // Logs a success message, including the grenade's classname.
+			TaskComplete();	// Marks the task as complete since the grenade is now memorized.
+		}
+		else
+		{
+			DevMsg("CP StartTask: FALHA ao memorizar granada. Som ou dono inválido.\n");	// Logs a failure message.
+
+			TaskFail(FAIL_NO_TARGET);	// Fails the entire schedule because no target could be found.
+		}
+		break;	// Exits the switch statement.
+	}
+
+	case TASK_METROPOLICE_KICK_LAUNCH: // [MODIFICATION] An instantaneous task that applies the kick's physical force to the memorized grenade.
+	{
+		DevMsg("CP StartTask: Starting TASK_METROPOLICE_KICK_LAUNCH.\n");	// Logs a debug message indicating the task has started.
+
+		if (m_hPulledObject.Get())	// Checks if a grenade has been previously memorized.
+		{
+			IPhysicsObject* pPhysObject = m_hPulledObject->VPhysicsGetObject();	// Gets the physics object associated with the grenade entity.
+			if (pPhysObject)	// Checks if the grenade has a valid physics object.
+			{
+				Vector vecForward, vecUp;	// Declares two vectors to store the NPC's orientation.
+				GetVectors(&vecForward, NULL, &vecUp);	// Populates the vectors with the NPC's forward and up directions.
+
+				Vector vecKickVelocity = (vecForward * 800.0f) + (vecUp * 200.0f);	// Calculates the kick's velocity vector (strong forward, slight upward push).
+				pPhysObject->SetVelocity(&vecKickVelocity, NULL);	// Applies the calculated velocity to the grenade's physics object, launching it.
+
+				EmitSound("NPC_MetroPolice.BatonImpact");	// Plays a sound effect for the impact.
+
+				m_flNextGrenadeCatchTime = gpGlobals->curtime + 2.5f;	// Sets the cooldown timer to prevent spamming the ability.
+
+				m_flPlaybackRate = 1.0f; // [CORRECTION] Resets the animation playback rate to normal after the fast kick.
+
+				DevMsg("CP StartTask: Grenade kicked and cooldown activated.\n");	// Logs a success message confirming the kick and cooldown.
+
+				m_hPulledObject = NULL;	// Clears the memorized grenade handle, as the interaction is over.
+			}
+		}
+		else
+		{
+			DevMsg("CP StartTask: ERROR in KICK_LAUNCH! Attempted to kick, but m_hPulledObject was null.\n"); // Logs an error message if no grenade was memorized.
+		}
+		TaskComplete();	// Marks the task as complete.
+		break;	// Exits the switch statement.
+	}
+
+	case TASK_METROPOLICE_PLAY_KICK_ANIMATION: // [MODIFICATION] A task that finds and plays the kick animation sequence by name.
+	{
+		int kickSequence = LookupSequence("kickdoorbaton");	// Looks up the animation sequence's ID using its string name.
+
+		if (kickSequence != ACTIVITY_NOT_AVAILABLE)	// Checks if the animation sequence was successfully found.
+		{
+			SetSequence(kickSequence);	// Sets the NPC's current animation to the one that was found.
+
+			m_flPlaybackRate = 3.0f; // [CORRECTION] Increases animation speed by 2x for an instant effect, even in combat.
+
+			SetIdealActivity(ACT_DO_NOT_DISTURB); // Sets the AI state to prevent other behaviors from interrupting the animation.
+		}
+		else
+		{
+			TaskFail(FAIL_NO_ROUTE); // Fails the entire schedule if the animation is not found.
+
+			DevMsg("ERROR: Metropolice could not find the 'kickdoorbaton' animation!\n"); // Logs an error message indicating the missing animation.
+		}
+		break;	// Exits the switch statement.
+	}
+
+
+	case TASK_METROPOLICE_WAIT_FOR_SENTENCE:
+		{
+			if ( FOkToMakeSound( pTask->flTaskData ) )
+			{
+				TaskComplete();
+			}
+		}
+		break;
+
+	case TASK_METROPOLICE_GET_PATH_TO_PRECHASE:
+		{
+			Assert( m_vecPreChaseOrigin != vec3_origin );
+			if ( GetNavigator()->SetGoal( m_vecPreChaseOrigin ) )
+			{
+				QAngle vecAngles( 0, m_flPreChaseYaw, 0 );
+				GetNavigator()->SetArrivalDirection( vecAngles );
+				TaskComplete();
+			}
+			else
+			{
+				TaskFail( FAIL_NO_ROUTE );
+			}
+			break;
+		}
+
+	case TASK_METROPOLICE_CLEAR_PRECHASE:
+		{
+			m_vecPreChaseOrigin = vec3_origin;
+			m_flPreChaseYaw = 0;
+			TaskComplete();
+			break;
+		}
+
+	case TASK_METROPOLICE_ACTIVATE_BATON:
+		{
+			// Simply early out if we're in here without a baton
+			if ( HasBaton() == false )
+			{
+				TaskComplete();
+				break;
+			}
+
+			bool activate = ( pTask->flTaskData != 0 );
+
+			if ( activate )
+			{
+				if ( BatonActive() || m_bShouldActivateBaton == false )
+				{
+					TaskComplete();
+					break;
+				}
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+				SpeakIfAllowed(TLK_COP_ACTIVATE_BATON, SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL);
+#else
+				m_Sentences.Speak( "METROPOLICE_ACTIVATE_BATON", SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL );
+#endif
+				SetIdealActivity( (Activity) ACT_ACTIVATE_BATON );
+			}
+			else
+			{
+				if ( BatonActive() == false || m_bShouldActivateBaton )
+				{
+					TaskComplete();
+					break;
+				}
+
+#ifdef METROPOLICE_USES_RESPONSE_SYSTEM
+				SpeakIfAllowed(TLK_COP_DEACTIVATE_BATON, SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL);
+#else
+				m_Sentences.Speak( "METROPOLICE_DEACTIVATE_BATON", SENTENCE_PRIORITY_NORMAL, SENTENCE_CRITERIA_NORMAL );
+#endif
+				SetIdealActivity( (Activity) ACT_DEACTIVATE_BATON );
+			}
+		}
+		break;
+
+	case TASK_METROPOLICE_DIE_INSTANTLY:
+		{
+			CTakeDamageInfo info;
+
+			info.SetAttacker( this );
+			info.SetInflictor( this );
+			info.SetDamage( m_iHealth );
+			info.SetDamageType( pTask->flTaskData );
+			info.SetDamageForce( Vector( 0.1, 0.1, 0.1 ) );
+
+			TakeDamage( info );
+
+			TaskComplete();
+		}
+		break;
+
+	case TASK_METROPOLICE_RESET_LEDGE_CHECK_TIME:
+		m_flNextLedgeCheckTime = gpGlobals->curtime;
+		TaskComplete();
+		break;
+
+	case TASK_METROPOLICE_LEAD_ARREST_ENEMY:
+	case TASK_METROPOLICE_ARREST_ENEMY:
+		m_flTaskCompletionTime = gpGlobals->curtime + pTask->flTaskData;
+		break;
+
+	case TASK_METROPOLICE_SIGNAL_FIRING_TIME:
+		EnemyResistingArrest();
+		TaskComplete();
+		break;
+
+#ifdef MAPBASE
+	case TASK_METROPOLICE_GET_PATH_TO_FORCED_GREN_LOS:
+		StartTask_GetPathToForced( pTask );
+		break;
+
+	case TASK_METROPOLICE_DEFER_SQUAD_GRENADES:
+		StartTask_DeferSquad( pTask );
+		break;
+
+	case TASK_METROPOLICE_FACE_TOSS_DIR:
+		break;
+
+	case TASK_METROPOLICE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET:
+		StartTask_FaceAltFireTarget( pTask );
+		break;
+#endif
+
+	case TASK_METROPOLICE_GET_PATH_TO_STITCH:
+		{
+			if ( !ShouldAttemptToStitch() )
+			{
+				TaskFail( FAIL_NO_ROUTE );
+				break;
+			}
+
+			Vector vecTarget, vecTargetVel;
+			PredictShootTargetPosition( 0.5f, 0.0f, 0.0f, &vecTarget, &vecTargetVel );
+
+			vecTarget -= GetAbsOrigin();
+			vecTarget.z = 0.0f;
+			float flDist = VectorNormalize( vecTarget );
+			if ( GetNavigator()->SetVectorGoal( vecTarget, flDist ) )
+			{
+				TaskComplete();
+			}
+			else
+			{
+				TaskFail( FAIL_NO_ROUTE );
+			}
+		}
+		break;
+
+	// Stitching aiming
+	case TASK_METROPOLICE_AIM_STITCH_TIGHTLY:
+		SetBurstMode( true );
+		AimBurstTightGrouping( pTask->flTaskData );
+		TaskComplete();
+		break;
+
+	case TASK_METROPOLICE_AIM_STITCH_AT_PLAYER:
+		SetBurstMode( true );
+		AimBurstAtEnemy( pTask->flTaskData );
+		TaskComplete();
+		break;
+
+	case TASK_METROPOLICE_AIM_STITCH_AT_AIRBOAT:
+		if ( IsEnemyInAnAirboat() )
+		{
+			SetBurstMode( true );
+			AimBurstAtEnemy( pTask->flTaskData );
+			TaskComplete();
+		}
+		else
+		{
+			TaskFail(FAIL_NO_TARGET);
+		}
+		break;
+
+	case TASK_METROPOLICE_AIM_STITCH_IN_FRONT_OF_AIRBOAT:
+		if ( IsEnemyInAnAirboat() )
+		{
+			SetBurstMode( true );
+			AimBurstInFrontOfEnemy( pTask->flTaskData );
+			TaskComplete();
+		}
+		else
+		{
+			TaskFail(FAIL_NO_TARGET);
+		}
+		break;
+
+	case TASK_METROPOLICE_AIM_STITCH_ALONG_SIDE_OF_AIRBOAT:
+		if ( IsEnemyInAnAirboat() )
+		{
+			SetBurstMode( true );
+			AimBurstAlongSideOfEnemy( pTask->flTaskData );
+			TaskComplete();
+		}
+		else
+		{
+			TaskFail(FAIL_NO_TARGET);
+		}
+		break;
+
+	case TASK_METROPOLICE_AIM_STITCH_BEHIND_AIRBOAT:
+		if ( IsEnemyInAnAirboat() )
+		{
+			SetBurstMode( true );
+			AimBurstBehindEnemy( pTask->flTaskData );
+			TaskComplete();
+		}
+		else
+		{
+			TaskFail(FAIL_NO_TARGET);
+		}
+		break;
+
+	case TASK_METROPOLICE_BURST_ATTACK:
+		ResetIdealActivity( ACT_RANGE_ATTACK1 );
+		break;
+
+	case TASK_METROPOLICE_STOP_FIRE_BURST:
+		{
+			SetBurstMode( false );
+			TaskComplete();
+		}
+		break;
+
+	case TASK_METROPOLICE_HARASS:
+		{
+			if( !( m_spawnflags & SF_METROPOLICE_NOCHATTER ) )
+			{
+				if( GetEnemy() && GetEnemy()->GetWaterLevel() > 0 )
+				{
+					EmitSound( "NPC_MetroPolice.WaterSpeech" );
+				}
+				else
+				{
+					EmitSound( "NPC_MetroPolice.HidingSpeech" );
+				}
+			}
+
+			TaskComplete();
+		}
+		break;
+
+	case TASK_METROPOLICE_RELOAD_FOR_BURST:
+		{
+			if (GetActiveWeapon())
+			{
+				int nDesiredShotCount = CountShotsInTime( pTask->flTaskData );
+
+				// Do our fake reload to simulate a bigger clip without having to change the SMG1
+				int nAddCount = nDesiredShotCount - GetActiveWeapon()->Clip1();
+				if ( nAddCount > 0 )
+				{
+					if ( m_nBurstReloadCount >= nAddCount )
+					{
+						GetActiveWeapon()->m_iClip1 += nAddCount;
+						m_nBurstReloadCount -= nAddCount;
+					}
+				}
+
+				if ( nDesiredShotCount <= GetActiveWeapon()->Clip1() )
+				{
+					TaskComplete();
+					break;
+				}
+			}
+
+			// Fake a TASK_RELOAD to make sure we've got a full clip...
+			Task_t reloadTask;
+			reloadTask.iTask = TASK_RELOAD;
+			reloadTask.flTaskData = 0.0f;
+			StartTask( &reloadTask );
+		}
+		break;
+
+	case TASK_RELOAD:
+		m_nBurstReloadCount = METROPOLICE_BURST_RELOAD_COUNT;
+		BaseClass::StartTask( pTask );
+		break;
+
+	case TASK_METROPOLICE_GET_PATH_TO_BESTSOUND_LOS:
+		{
+		}
+		break;
+
+	default:
+		BaseClass::StartTask( pTask );
+		break;
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+//
+// Run tasks!
+//
+//-----------------------------------------------------------------------------
+
+
+//-----------------------------------------------------------------------------
+// He's resisting arrest!
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::EnemyResistingArrest()
+{
+	// Prevent any other arrest from being made in this squad
+	// and tell them all that the player is resisting arrest!
+	
+	if ( m_pSquad != NULL )
+	{
+		AISquadIter_t iter;
+		CAI_BaseNPC *pSquadmate = m_pSquad->GetFirstMember( &iter );
+		while ( pSquadmate )
+		{
+			pSquadmate->RemoveSpawnFlags( SF_METROPOLICE_ARREST_ENEMY );
+			pSquadmate->SetCondition( COND_METROPOLICE_ENEMY_RESISTING_ARREST );
+			pSquadmate = m_pSquad->GetNextMember( &iter );
+		}
+	}
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : pTask - 
+//-----------------------------------------------------------------------------
+#define FLEEING_DISTANCE_SQR (100 * 100)
+
+void CNPC_MetroPolice::RunTask( const Task_t *pTask )
+{
+	switch( pTask->iTask )
+	{
+
+
+		// [NOVO] Adicione este case
+	case TASK_METROPOLICE_PLAY_KICK_ANIMATION:
+	{
+		// Mantém o NPC "ocupado" para que ele não tente fazer outra coisa.
+		SetIdealActivity(ACT_DO_NOT_DISTURB);
+
+		// Verifica a cada frame se a animação que está tocando já terminou.
+		if (IsSequenceFinished())
+		{
+			// Se a animação terminou, a tarefa está completa.
+			TaskComplete();
+		}
+		break;
+	}
+	case TASK_WAIT_FOR_MOVEMENT:
+		BaseClass::RunTask( pTask );
+		break;
+
+	case TASK_METROPOLICE_WAIT_FOR_SENTENCE:
+		{
+			if ( FOkToMakeSound( pTask->flTaskData ) )
+			{
+				TaskComplete();
+			}
+		}
+		break;
+
+	case TASK_METROPOLICE_ACTIVATE_BATON:
+		AutoMovement();
+		
+		if ( IsActivityFinished() )
+		{
+			TaskComplete();
+		}	
+		break;
+
+	case TASK_METROPOLICE_BURST_ATTACK:
+		{
+			AutoMovement( );
+
+			Vector vecAimPoint;
+			GetMotor()->SetIdealYawToTargetAndUpdate( m_vecBurstTargetPos, AI_KEEP_YAW_SPEED );
+
+			if ( IsActivityFinished() )
+			{
+				if ( GetShotRegulator()->IsInRestInterval() )
+				{
+					TaskComplete();
+				}
+				else
+				{
+					OnRangeAttack1();
+					ResetIdealActivity( ACT_RANGE_ATTACK1 );
+				}
+			}
+		}
+		break;
+
+	case TASK_METROPOLICE_RELOAD_FOR_BURST:
+		{
+			// Fake a TASK_RELOAD
+			Task_t reloadTask;
+			reloadTask.iTask = TASK_RELOAD;
+			reloadTask.flTaskData = 0.0f;
+			RunTask( &reloadTask );
+		}
+		break;
+
+	case TASK_METROPOLICE_LEAD_ARREST_ENEMY:
+	case TASK_METROPOLICE_ARREST_ENEMY:
+		{
+			if ( !GetEnemy() )
+			{
+				TaskComplete();
+				break;
+			}
+
+			if ( gpGlobals->curtime >= m_flTaskCompletionTime )
+			{
+				TaskComplete();
+				break;
+			}
+
+			// Complete the arrest after the last squad member has a bead on the enemy
+			// But only if you're the first guy who saw him
+			if ( pTask->iTask == TASK_METROPOLICE_LEAD_ARREST_ENEMY )
+			{
+				int nArrestCount = SquadArrestCount();
+				if ( nArrestCount == m_pSquad->NumMembers() )
+				{
+					TaskComplete();
+					break;
+				}
+
+				// Do a distance check of the enemy from his initial position.
+				// Shoot if he gets too far.
+				if ( m_vSavePosition.DistToSqr( GetEnemy()->GetAbsOrigin() ) > FLEEING_DISTANCE_SQR )
+				{
+					SpeakSentence( METROPOLICE_SENTENCE_HES_RUNNING );
+					EnemyResistingArrest();
+					break;
+				}
+			}
+
+			// Keep aiming at the enemy
+			if ( GetEnemy() && FacingIdeal() )
+			{
+				float flNewIdealYaw = CalcIdealYaw( GetEnemy()->EyePosition() );
+				if ( fabs(UTIL_AngleDiff( GetMotor()->GetIdealYaw(), flNewIdealYaw )) >= 45.0f )
+				{
+					GetMotor()->SetIdealYawToTarget( GetEnemy()->EyePosition() );
+					SetTurnActivity(); 
+				}
+			}
+			GetMotor()->UpdateYaw();
+		}
+		break;
+
+	case TASK_METROPOLICE_GET_PATH_TO_BESTSOUND_LOS:
+		{
+			switch( GetTaskInterrupt() )
+			{
+			case 0:
+				{
+					CSound *pSound = GetBestSound();
+					if (!pSound)
+					{
+						TaskFail(FAIL_NO_SOUND);
+					}
+					else
+					{
+						float flMaxRange = 2000;
+						float flMinRange = 0;
+						if ( GetActiveWeapon() )
+						{
+							flMaxRange = MAX( GetActiveWeapon()->m_fMaxRange1, GetActiveWeapon()->m_fMaxRange2 );
+							flMinRange = MIN( GetActiveWeapon()->m_fMinRange1, GetActiveWeapon()->m_fMinRange2 );
+						}
+
+						// Check against NPC's max range
+						if (flMaxRange > m_flDistTooFar)
+						{
+							flMaxRange = m_flDistTooFar;
+						}
+
+						// Why not doing lateral LOS first?
+
+						Vector losTarget = pSound->GetSoundReactOrigin();
+						if ( GetTacticalServices()->FindLos( pSound->GetSoundReactOrigin(), losTarget, flMinRange, flMaxRange, 1.0, &m_vInterruptSavePosition ) )
+						{
+							TaskInterrupt();
+						}
+						else
+						{
+							TaskFail(FAIL_NO_SHOOT);
+						}
+					}
+				}
+				break;
+
+			case 1:
+				{
+					AI_NavGoal_t goal( m_vInterruptSavePosition, ACT_RUN, AIN_HULL_TOLERANCE );
+					GetNavigator()->SetGoal( goal );
+				}
+				break;
+			}
+		}
+		break;
+
+#ifdef MAPBASE
+	case TASK_METROPOLICE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET:
+		RunTask_FaceAltFireTarget( pTask );
+		break;
+
+	case TASK_METROPOLICE_GET_PATH_TO_FORCED_GREN_LOS:
+		RunTask_GetPathToForced( pTask );
+		break;
+
+	case TASK_METROPOLICE_FACE_TOSS_DIR:
+		RunTask_FaceTossDir( pTask );
+		break;
+#endif
+
+	default:
+		BaseClass::RunTask( pTask );
+		break;
+	}
+}
+
+
+		
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : pevInflictor - 
+//			pAttacker - 
+//			flDamage - 
+//			bitsDamageType - 
+// Output : int
+//-----------------------------------------------------------------------------
+int CNPC_MetroPolice::OnTakeDamage_Alive( const CTakeDamageInfo &inputInfo )
+{
+	CTakeDamageInfo info = inputInfo;
+
+	if ( HasSpawnFlags( SF_METROPOLICE_ARREST_ENEMY ) )
+	{
+		EnemyResistingArrest();
+	}
+
+#if 0
+	// Die instantly from a hit in idle/alert states
+	if( m_NPCState == NPC_STATE_IDLE || m_NPCState == NPC_STATE_ALERT )
+	{
+		info.SetDamage( m_iHealth );
+	}
+#endif //0
+
+	if (info.GetAttacker() == GetEnemy())
+	{
+		// Keep track of recent damage by my attacker. If it seems like we're
+		// being killed, consider running off and hiding.
+		m_nRecentDamage += info.GetDamage();
+		m_flRecentDamageTime = gpGlobals->curtime;
+	}
+
+	return BaseClass::OnTakeDamage_Alive( info ); 
+}
+
+
+//-----------------------------------------------------------------------------
+// Purpose: I want to deploy a manhack. Can I?
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::CanDeployManhack( void )
+{
+	if ( HasSpawnFlags( SF_METROPOLICE_NO_MANHACK_DEPLOY ) )
+		return false;
+
+	// Nope, already have one out.
+	if( m_hManhack != NULL )
+		return false;
+
+	// Nope, don't have any!
+	if( m_iManhacks < 1 )
+		return false;
+
+	return true;
+}
+ 
+//-----------------------------------------------------------------------------
+// Purpose: Allows for modification of the interrupt mask for the current schedule.
+//			In the most cases the base implementation should be called first.
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::BuildScheduleTestBits( void )
+{
+	BaseClass::BuildScheduleTestBits();
+
+	if ( PlayerIsCriminal() == false )
+	{
+		SetCustomInterruptCondition( COND_METROPOLICE_PHYSOBJECT_ASSAULT );
+	}
+
+	//FIXME: Always interrupt for now
+	if ( !IsInAScript() && 
+		 !IsCurSchedule( SCHED_METROPOLICE_SHOVE ) &&
+		 !IsCurSchedule( SCHED_MELEE_ATTACK1 ) &&
+		 !IsCurSchedule( SCHED_RELOAD ) && 
+		 !IsCurSchedule( SCHED_METROPOLICE_ACTIVATE_BATON ) )
+	{
+		SetCustomInterruptCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+	}
+
+	if ( !IsCurSchedule( SCHED_METROPOLICE_BURNING_RUN ) && !IsCurSchedule( SCHED_METROPOLICE_BURNING_STAND ) && !IsMoving() )
+	{
+		SetCustomInterruptCondition( COND_METROPOLICE_ON_FIRE );
+	}
+
+	if (IsCurSchedule(SCHED_TAKE_COVER_FROM_ENEMY))
+	{
+		ClearCustomInterruptCondition( COND_LIGHT_DAMAGE );
+		ClearCustomInterruptCondition( COND_HEAVY_DAMAGE );
+	}
+
+	if ( !IsCurSchedule( SCHED_CHASE_ENEMY ) &&
+		 !IsCurSchedule( SCHED_METROPOLICE_ACTIVATE_BATON ) &&
+		 !IsCurSchedule( SCHED_METROPOLICE_DEACTIVATE_BATON ) &&
+		 !IsCurSchedule( SCHED_METROPOLICE_SHOVE ) && 
+		 !IsCurSchedule( SCHED_METROPOLICE_RETURN_TO_PRECHASE ) )
+	{
+		SetCustomInterruptCondition( COND_METROPOLICE_CHANGE_BATON_STATE );
+	}
+
+	if ( IsCurSchedule( SCHED_MELEE_ATTACK1 ) )
+	{
+		if ( gpGlobals->curtime - m_flLastDamageFlinchTime < 10.0 )
+		{
+			ClearCustomInterruptCondition( COND_LIGHT_DAMAGE );
+			ClearCustomInterruptCondition( COND_HEAVY_DAMAGE );
+		}
+	}
+	else if ( HasBaton() && IsCurSchedule( SCHED_COMBAT_FACE ) && !m_BatonSwingTimer.Expired() )
+	{
+		ClearCustomInterruptCondition( COND_CAN_MELEE_ATTACK1 );
+	}
+
+#ifdef MAPBASE
+	if (gpGlobals->curtime < m_flNextAttack)
+	{
+		ClearCustomInterruptCondition( COND_CAN_RANGE_ATTACK1 );
+		ClearCustomInterruptCondition( COND_CAN_RANGE_ATTACK2 );
+	}
+#endif
+}
+
+//-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+WeaponProficiency_t CNPC_MetroPolice::CalcWeaponProficiency( CBaseCombatWeapon *pWeapon )
 {
 #ifdef MAPBASE
-	// Check base class as well
-	return !IsCrouching() && BaseClass::ShouldPickADeathPose();
+	if (EntIsClass(pWeapon, gm_isz_class_Pistol))
 #else
-	return !IsCrouching();
+	if( FClassnameIs( pWeapon, "weapon_pistol" ) )
 #endif
+	{
+		return WEAPON_PROFICIENCY_POOR;
+	}
+
+#ifdef MAPBASE
+	if (EntIsClass(pWeapon, gm_isz_class_SMG1))
+#else
+	if( FClassnameIs( pWeapon, "weapon_smg1" ) )
+#endif
+	{
+		return WEAPON_PROFICIENCY_VERY_GOOD;
+	}
+
+	return BaseClass::CalcWeaponProficiency( pWeapon );
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::GatherConditions( void )
+{
+	BaseClass::GatherConditions();
+
+	if ( m_bPlayerTooClose == false )
+	{
+		ClearCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+	}
+
+	CBasePlayer *pPlayer = UTIL_PlayerByIndex( 1 );
+	
+	// FIXME: Player can be NULL here during level transitions.
+	if ( !pPlayer )
+		return;
+
+	float distToPlayerSqr = ( pPlayer->GetAbsOrigin() - GetAbsOrigin() ).LengthSqr();
+	
+	// See if we're too close
+	if ( pPlayer->GetGroundEntity() == this )
+	{
+		// Always beat a player on our head
+		m_iNumPlayerHits = 0;
+		SetCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+	}
+	else if ( (distToPlayerSqr < (42.0f*42.0f) && FVisible(pPlayer)) )
+	{
+		// Ignore the player if we've been beating him, but not if we haven't moved
+		if ( m_iNumPlayerHits < 3 || m_vecPreChaseOrigin == vec3_origin )
+		{
+			SetCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+		}
+	}
+	else
+	{
+		ClearCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+
+		// Don't clear out the player hit count for a few seconds after we last hit him
+		// This avoids states where two metropolice have the player pinned between them.
+		if ( (gpGlobals->curtime - GetLastAttackTime()) > 3 )
+		{
+			m_iNumPlayerHits = 0;
+		}
+
+		m_bPlayerTooClose = false;
+	}
+
+	if( metropolice_move_and_melee.GetBool() )
+	{
+		if( IsMoving() && HasCondition(COND_CAN_MELEE_ATTACK1) && HasBaton() )
+		{
+			if ( m_BatonSwingTimer.Expired() )
+			{
+				m_BatonSwingTimer.Set( 1.0, 1.75 );
+
+				Activity activity = TranslateActivity( ACT_MELEE_ATTACK_SWING_GESTURE );
+				Assert( activity != ACT_INVALID );
+				AddGesture( activity );
+			}
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::HasBaton( void )
+{
+	CBaseCombatWeapon *pWeapon = GetActiveWeapon();
+
+	if ( pWeapon )
+#ifdef MAPBASE
+		return EntIsClass(pWeapon, gm_isz_class_Stunstick);
+#else
+		return FClassnameIs( pWeapon, "weapon_stunstick" );
+#endif
+
+	return false;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::BatonActive( void )
+{
+#if !defined(HL2MP) || defined(MAPBASE)
+
+	CWeaponStunStick *pStick = dynamic_cast<CWeaponStunStick *>(GetActiveWeapon());
+
+	if ( pStick )
+		return pStick->GetStunState();
+#endif
+
+	return false;
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : state - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::SetBatonState( bool state )
+{
+	if ( !HasBaton() )
+		return;
+
+	if ( m_bShouldActivateBaton != state )
+	{
+		m_bShouldActivateBaton = state;
+		SetCondition( COND_METROPOLICE_CHANGE_BATON_STATE );
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : *pSound - 
+// Output : Returns true on success, false on failure.
+//-----------------------------------------------------------------------------
+bool CNPC_MetroPolice::QueryHearSound( CSound *pSound )
+{
+	// Only behave differently if the player is pre-criminal
+	if ( PlayerIsCriminal() == false )
+	{
+		// If the person making the sound was a friend, don't respond
+		if ( pSound->IsSoundType( SOUND_DANGER ) && pSound->m_hOwner && IRelationType( pSound->m_hOwner ) == D_NU )
+			return false;
+	}
+
+	return BaseClass::QueryHearSound( pSound );
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : index - 
+//			*pEvent - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::VPhysicsCollision( int index, gamevcollisionevent_t *pEvent )
+{
+	BaseClass::VPhysicsCollision( index, pEvent );
+
+	int otherIndex = !index;
+	
+	CBaseEntity *pHitEntity = pEvent->pEntities[otherIndex];
+
+	if ( pEvent->pObjects[otherIndex]->GetGameFlags() & FVPHYSICS_PLAYER_HELD )
+	{
+		CHL2_Player *pPlayer = dynamic_cast<CHL2_Player *>(UTIL_PlayerByIndex( 1 ));
+
+		// See if it's being held by the player
+		if ( pPlayer != NULL && pPlayer->IsHoldingEntity( pHitEntity ) )
+		{
+			//TODO: Play an angry sentence, "Get that outta here!"
+
+			if ( IsCurSchedule( SCHED_METROPOLICE_SHOVE ) == false )
+			{
+				SetCondition( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+				m_bPlayerTooClose = true;
+			}
+		}
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: 
+// Input  : *pTarget - 
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::StunnedTarget( CBaseEntity *pTarget )
+{
+	SetLastAttackTime( gpGlobals->curtime );
+
+	if ( pTarget && pTarget->IsPlayer() )
+	{
+		m_OnStunnedPlayer.FireOutput( this, this );
+		m_iNumPlayerHits++;
+	}
+}
+
+//-----------------------------------------------------------------------------
+// Purpose: Use response for when the player is pre-criminal
+//-----------------------------------------------------------------------------
+void CNPC_MetroPolice::PrecriminalUse( CBaseEntity *pActivator, CBaseEntity *pCaller, USE_TYPE useType, float value )
+{
+	if ( IsInAScript() )
+		return;
+	// Don't respond if I'm busy hating the player
+	if ( IRelationType( pActivator ) == D_HT || ((GetState() != NPC_STATE_ALERT) && (GetState() != NPC_STATE_IDLE)) )
+		return;
+	if ( PlayerIsCriminal() )
+		return;
+
+	// Treat it like the player's bothered the cop
+	IncrementPlayerCriminalStatus();
+
+	// If we've hit max warnings, and we're allowed to chase, go for it
+	if ( m_nNumWarnings == METROPOLICE_MAX_WARNINGS )
+	{
+		AdministerJustice();
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -4220,822 +6305,792 @@ bool CNPC_Combine::ShouldPickADeathPose(void)
 // Schedules
 //
 //-----------------------------------------------------------------------------
+AI_BEGIN_CUSTOM_NPC( npc_metropolice, CNPC_MetroPolice )
 
-AI_BEGIN_CUSTOM_NPC(npc_combine, CNPC_Combine)
+	gm_flTimeLastSpokePeek = 0;
 
-//Tasks
-DECLARE_TASK(TASK_COMBINE_FACE_TOSS_DIR)
-DECLARE_TASK(TASK_COMBINE_IGNORE_ATTACKS)
-DECLARE_TASK(TASK_COMBINE_SIGNAL_BEST_SOUND)
-DECLARE_TASK(TASK_COMBINE_DEFER_SQUAD_GRENADES)
-DECLARE_TASK(TASK_COMBINE_CHASE_ENEMY_CONTINUOUSLY)
-DECLARE_TASK(TASK_COMBINE_DIE_INSTANTLY)
-DECLARE_TASK(TASK_COMBINE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET)
-DECLARE_TASK(TASK_COMBINE_GET_PATH_TO_FORCED_GREN_LOS)
-DECLARE_TASK(TASK_COMBINE_SET_STANDING)
-DECLARE_TASK(TASK_COMBINE_PULL_GRENADE)		// [MODIFICATION] For the "Catch and Return" ability: physically pulls the grenade towards the NPC.
-DECLARE_TASK(TASK_COMBINE_LAUNCH_GRENADE)		// [MODIFICATION] For the "Catch and Return" ability: launches the caught grenade back.
-DECLARE_TASK(TASK_COMBINE_FACE_GRENADE)		// [MODIFICATION] For both abilities: makes the Combine perform a high-speed turn to face the grenade.
-DECLARE_TASK(TASK_COMBINE_MEMORIZE_GRENADE)	// [MODIFICATION] For the "Kick" ability: "memorizes" the grenade as a target.
-DECLARE_TASK(TASK_COMBINE_KICK_LAUNCH)		// [MODIFICATION] For the "Kick" ability: applies the kick physics to the memorized grenade.
-//Activities
-#if !SHARED_COMBINE_ACTIVITIES
-DECLARE_ACTIVITY(ACT_COMBINE_THROW_GRENADE)
-#endif
-DECLARE_ACTIVITY(ACT_COMBINE_LAUNCH_GRENADE)
-DECLARE_ACTIVITY(ACT_COMBINE_BUGBAIT)
-#if !SHARED_COMBINE_ACTIVITIES
-DECLARE_ACTIVITY(ACT_COMBINE_AR2_ALTFIRE)
-#endif
-DECLARE_ACTIVITY(ACT_WALK_EASY)
-DECLARE_ACTIVITY(ACT_WALK_MARCH)
+	DECLARE_ANIMEVENT( AE_METROPOLICE_BATON_ON );
+	DECLARE_ANIMEVENT( AE_METROPOLICE_BATON_OFF );
+	DECLARE_ANIMEVENT( AE_METROPOLICE_SHOVE );
+	DECLARE_ANIMEVENT( AE_METROPOLICE_START_DEPLOY );
+	DECLARE_ANIMEVENT( AE_METROPOLICE_DRAW_PISTOL );
+	DECLARE_ANIMEVENT( AE_METROPOLICE_DEPLOY_MANHACK );
 #ifdef MAPBASE
-DECLARE_ACTIVITY(ACT_TURRET_CARRY_IDLE)
-DECLARE_ACTIVITY(ACT_TURRET_CARRY_WALK)
-DECLARE_ACTIVITY(ACT_TURRET_CARRY_RUN)
+	DECLARE_ANIMEVENT( COMBINE_AE_BEGIN_ALTFIRE )
+	DECLARE_ANIMEVENT( COMBINE_AE_ALTFIRE )
 #endif
 
-DECLARE_ANIMEVENT(COMBINE_AE_BEGIN_ALTFIRE)
-DECLARE_ANIMEVENT(COMBINE_AE_ALTFIRE)
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_CHARGE_ENEMY );
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_HARASS );
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_DEPLOY_MANHACK );
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_ATTACK_OCCLUDER1 );
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_ATTACK_OCCLUDER2 );
+#ifdef MAPBASE
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_COVERING_FIRE1 );
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_COVERING_FIRE2 );
+#endif
+	DECLARE_SQUADSLOT( SQUAD_SLOT_POLICE_ARREST_ENEMY );
 
-DECLARE_SQUADSLOT(SQUAD_SLOT_GRENADE1)
-DECLARE_SQUADSLOT(SQUAD_SLOT_GRENADE2)
+	DECLARE_ACTIVITY( ACT_METROPOLICE_DRAW_PISTOL );
+	DECLARE_ACTIVITY( ACT_METROPOLICE_DEPLOY_MANHACK );
+	DECLARE_ACTIVITY( ACT_METROPOLICE_FLINCH_BEHIND );
+	DECLARE_ACTIVITY( ACT_PUSH_PLAYER );
+	DECLARE_ACTIVITY( ACT_MELEE_ATTACK_THRUST );
+	DECLARE_ACTIVITY( ACT_ACTIVATE_BATON );
+	DECLARE_ACTIVITY( ACT_DEACTIVATE_BATON );
+	DECLARE_ACTIVITY( ACT_WALK_BATON );
+	DECLARE_ACTIVITY( ACT_IDLE_ANGRY_BATON );
 
-DECLARE_CONDITION(COND_COMBINE_NO_FIRE)
-DECLARE_CONDITION(COND_COMBINE_DEAD_FRIEND)
-DECLARE_CONDITION(COND_COMBINE_SHOULD_PATROL)
-DECLARE_CONDITION(COND_COMBINE_HIT_BY_BUGBAIT)
-DECLARE_CONDITION(COND_COMBINE_DROP_GRENADE)
-DECLARE_CONDITION(COND_COMBINE_ON_FIRE)
-DECLARE_CONDITION(COND_COMBINE_ATTACK_SLOT_AVAILABLE)
+	DECLARE_INTERACTION( g_interactionMetrocopStartedStitch );	
+	DECLARE_INTERACTION( g_interactionMetrocopIdleChatter );	
+	DECLARE_INTERACTION( g_interactionMetrocopClearSentenceQueues );
 
-DECLARE_INTERACTION(g_interactionCombineBash);
+	DECLARE_TASK( TASK_METROPOLICE_HARASS );
+	DECLARE_TASK( TASK_METROPOLICE_DIE_INSTANTLY );
+	DECLARE_TASK( TASK_METROPOLICE_BURST_ATTACK );
+	DECLARE_TASK( TASK_METROPOLICE_STOP_FIRE_BURST );
+	DECLARE_TASK( TASK_METROPOLICE_AIM_STITCH_AT_PLAYER );
+	DECLARE_TASK( TASK_METROPOLICE_AIM_STITCH_AT_AIRBOAT );
+	DECLARE_TASK( TASK_METROPOLICE_AIM_STITCH_IN_FRONT_OF_AIRBOAT );
+	DECLARE_TASK( TASK_METROPOLICE_AIM_STITCH_TIGHTLY );
+	DECLARE_TASK( TASK_METROPOLICE_AIM_STITCH_ALONG_SIDE_OF_AIRBOAT );
+	DECLARE_TASK( TASK_METROPOLICE_AIM_STITCH_BEHIND_AIRBOAT );
+	DECLARE_TASK( TASK_METROPOLICE_RELOAD_FOR_BURST );
+	DECLARE_TASK( TASK_METROPOLICE_GET_PATH_TO_STITCH );
+	DECLARE_TASK( TASK_METROPOLICE_RESET_LEDGE_CHECK_TIME );
+	DECLARE_TASK( TASK_METROPOLICE_GET_PATH_TO_BESTSOUND_LOS );
+	DECLARE_TASK( TASK_METROPOLICE_ARREST_ENEMY );
+	DECLARE_TASK( TASK_METROPOLICE_LEAD_ARREST_ENEMY );
+	DECLARE_TASK( TASK_METROPOLICE_SIGNAL_FIRING_TIME );
+	DECLARE_TASK( TASK_METROPOLICE_ACTIVATE_BATON );
+	DECLARE_TASK( TASK_METROPOLICE_WAIT_FOR_SENTENCE );
+	DECLARE_TASK( TASK_METROPOLICE_GET_PATH_TO_PRECHASE );
+	DECLARE_TASK( TASK_METROPOLICE_CLEAR_PRECHASE );
+	DECLARE_TASK(TASK_METROPOLICE_FACE_GRENADE);		// [MODIFICATION] Declares the task for making the NPC quickly face the target grenade.
+	DECLARE_TASK(TASK_METROPOLICE_MEMORIZE_GRENADE);	// [MODIFICATION] Declares the task for identifying and storing a handle to the target grenade.
+	DECLARE_TASK(TASK_METROPOLICE_KICK_LAUNCH);			// [MODIFICATION] Declares the task that applies the physical kick force to the grenade.
+	DECLARE_TASK(TASK_METROPOLICE_PLAY_KICK_ANIMATION); // [MODIFICATION] Declares the task for playing the kick animation sequence by name.
+	
+	
+#ifdef MAPBASE
+	DECLARE_TASK( TASK_METROPOLICE_GET_PATH_TO_FORCED_GREN_LOS )
+	DECLARE_TASK( TASK_METROPOLICE_DEFER_SQUAD_GRENADES )
+	DECLARE_TASK( TASK_METROPOLICE_FACE_TOSS_DIR )
+	DECLARE_TASK( TASK_METROPOLICE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET )
+#endif
 
-//=========================================================
-// SCHED_COMBINE_TAKE_COVER_FROM_BEST_SOUND
-//
-//	hide from the loudest sound source (to run from grenade)
+	DECLARE_CONDITION( COND_METROPOLICE_ON_FIRE );
+	DECLARE_CONDITION( COND_METROPOLICE_ENEMY_RESISTING_ARREST );
+//	DECLARE_CONDITION( COND_METROPOLICE_START_POLICING );
+	DECLARE_CONDITION( COND_METROPOLICE_PLAYER_TOO_CLOSE );
+	DECLARE_CONDITION( COND_METROPOLICE_CHANGE_BATON_STATE );
+	DECLARE_CONDITION( COND_METROPOLICE_PHYSOBJECT_ASSAULT );
+
+
+	//=========================================================
 //=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_TAKE_COVER_FROM_BEST_SOUND,
+	SCHED_METROPOLICE_WAKE_ANGRY,
 
 	"	Tasks"
-	"		 TASK_SET_FAIL_SCHEDULE				SCHEDULE:SCHED_COMBINE_RUN_AWAY_FROM_BEST_SOUND"
-	"		 TASK_STOP_MOVING					0"
-	"		 TASK_COMBINE_SIGNAL_BEST_SOUND		0"
-	"		 TASK_FIND_COVER_FROM_BEST_SOUND	0"
-	"		 TASK_RUN_PATH						0"
-	"		 TASK_WAIT_FOR_MOVEMENT				0"
-	"		 TASK_REMEMBER						MEMORY:INCOVER"
-	"		 TASK_FACE_REASONABLE				0"
-	""
-	"	Interrupts"
-)
-
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_RUN_AWAY_FROM_BEST_SOUND,
-
-	"	Tasks "
-	"		 TASK_SET_FAIL_SCHEDULE					SCHEDULE:SCHED_COWER"
-	"		 TASK_GET_PATH_AWAY_FROM_BEST_SOUND		600"
-	"		 TASK_RUN_PATH_TIMED					2"
-	"		 TASK_STOP_MOVING						0"
-	""
-	"	Interrupts"
-)
-//=========================================================
-//	SCHED_COMBINE_COMBAT_FAIL
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_COMBAT_FAIL,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING			0"
-	"		TASK_SET_ACTIVITY			ACTIVITY:ACT_IDLE "
-	"		TASK_WAIT_FACE_ENEMY		2"
-	"		TASK_WAIT_PVS				0"
-	""
-	"	Interrupts"
-	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_CAN_RANGE_ATTACK2"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK2"
-)
-
-//=========================================================
-// SCHED_COMBINE_VICTORY_DANCE
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_VICTORY_DANCE,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_FACE_ENEMY						0"
-	"		TASK_WAIT							1.5"
-	"		TASK_GET_PATH_TO_ENEMY_CORPSE		0"
-	"		TASK_WALK_PATH						0"
-	"		TASK_WAIT_FOR_MOVEMENT				0"
-	"		TASK_FACE_ENEMY						0"
-	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_VICTORY_DANCE"
-	""
-	"	Interrupts"
-	"		COND_NEW_ENEMY"
-	"		COND_LIGHT_DAMAGE"
-	"		COND_HEAVY_DAMAGE"
-)
-
-//=========================================================
-// SCHED_COMBINE_ASSAULT
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_ASSAULT,
-
-	"		Tasks "
-	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_COMBINE_ESTABLISH_LINE_OF_FIRE"
-	"		TASK_SET_TOLERANCE_DISTANCE		48"
-	"		TASK_GET_PATH_TO_ENEMY_LKP		0"
-	"		TASK_COMBINE_IGNORE_ATTACKS		0.2"
-	"		TASK_SPEAK_SENTENCE				0"
-	"		TASK_RUN_PATH					0"
-	//		"		TASK_COMBINE_MOVE_AND_AIM		0"
-	"		TASK_WAIT_FOR_MOVEMENT			0"
-	"		TASK_COMBINE_IGNORE_ATTACKS		0.0"
-	""
-	"	Interrupts "
-	"		COND_NEW_ENEMY"
-	"		COND_ENEMY_DEAD"
-	"		COND_ENEMY_UNREACHABLE"
-	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_RANGE_ATTACK2"
-	"		COND_CAN_MELEE_ATTACK2"
-	"		COND_TOO_FAR_TO_ATTACK"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-)
-
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_ESTABLISH_LINE_OF_FIRE,
-
-	"	Tasks "
-	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_FAIL_ESTABLISH_LINE_OF_FIRE"
-	"		TASK_SET_TOLERANCE_DISTANCE		48"
-	"		TASK_GET_PATH_TO_ENEMY_LKP_LOS	0"
-	"		TASK_COMBINE_SET_STANDING		1"
-	"		TASK_SPEAK_SENTENCE				1"
-	"		TASK_RUN_PATH					0"
-	"		TASK_WAIT_FOR_MOVEMENT			0"
-	"		TASK_COMBINE_IGNORE_ATTACKS		0.0"
-	"		TASK_SET_SCHEDULE				SCHEDULE:SCHED_COMBAT_FACE"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_IDLE"
+	"		TASK_FACE_ENEMY					0"
 	"	"
-	"	Interrupts "
-	"		COND_NEW_ENEMY"
-	"		COND_ENEMY_DEAD"
-	//"		COND_CAN_RANGE_ATTACK1"
-	//"		COND_CAN_RANGE_ATTACK2"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK2"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_HEAVY_DAMAGE"
-)
+	"	Interrupts"
+);
+
 
 //=========================================================
-// SCHED_COMBINE_PRESS_ATTACK
+// > InvestigateSound
+//
+//	sends a monster to the location of the
+//	sound that was just heard to check things out.
 //=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_PRESS_ATTACK,
+	SCHED_METROPOLICE_INVESTIGATE_SOUND,
 
-	"	Tasks "
-	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_COMBINE_ESTABLISH_LINE_OF_FIRE"
-	"		TASK_SET_TOLERANCE_DISTANCE		72"
-	"		TASK_GET_PATH_TO_ENEMY_LKP		0"
-	"		TASK_COMBINE_SET_STANDING		1"
+	"	Tasks"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_STORE_LASTPOSITION			0"
+	"		TASK_METROPOLICE_GET_PATH_TO_BESTSOUND_LOS		0"
+	"		TASK_FACE_IDEAL					0"
+//	"		TASK_SET_TOLERANCE_DISTANCE		32"
 	"		TASK_RUN_PATH					0"
 	"		TASK_WAIT_FOR_MOVEMENT			0"
-	""
-	"	Interrupts "
-	"		COND_NEW_ENEMY"
-	"		COND_ENEMY_DEAD"
-	"		COND_ENEMY_UNREACHABLE"
-	"		COND_NO_PRIMARY_AMMO"
-	"		COND_LOW_PRIMARY_AMMO"
-	"		COND_TOO_CLOSE_TO_ATTACK"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK2"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-)
-
-//=========================================================
-// SCHED_COMBINE_COMBAT_FACE
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_COMBAT_FACE,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING			0"
-	"		TASK_SET_ACTIVITY			ACTIVITY:ACT_IDLE"
-	"		TASK_FACE_ENEMY				0"
-	"		 TASK_WAIT					1.5"
-	//"		 TASK_SET_SCHEDULE			SCHEDULE:SCHED_COMBINE_SWEEP"
-	""
-	"	Interrupts"
-	"		COND_NEW_ENEMY"
-	"		COND_ENEMY_DEAD"
-	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_CAN_RANGE_ATTACK2"
-)
-
-//=========================================================
-// 	SCHED_HIDE_AND_RELOAD	
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_HIDE_AND_RELOAD,
-
-	"	Tasks"
-	"		TASK_SET_FAIL_SCHEDULE		SCHEDULE:SCHED_RELOAD"
-	"		TASK_FIND_COVER_FROM_ENEMY	0"
-	"		TASK_RUN_PATH				0"
-	"		TASK_WAIT_FOR_MOVEMENT		0"
-	"		TASK_REMEMBER				MEMORY:INCOVER"
-	"		TASK_FACE_ENEMY				0"
-	"		TASK_RELOAD					0"
-	""
-	"	Interrupts"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK2"
-	"		COND_HEAVY_DAMAGE"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-)
-
-//=========================================================
-// SCHED_COMBINE_SIGNAL_SUPPRESS
-//	don't stop shooting until the clip is
-//	empty or combine gets hurt.
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_SIGNAL_SUPPRESS,
-
-	"	Tasks"
 	"		TASK_STOP_MOVING				0"
-	"		TASK_FACE_IDEAL					0"
-	"		TASK_PLAY_SEQUENCE_FACE_ENEMY	ACTIVITY:ACT_SIGNAL_GROUP"
-	"		TASK_COMBINE_SET_STANDING		0"
-	"		TASK_RANGE_ATTACK1				0"
+	"		TASK_WAIT						5"
+	"		TASK_GET_PATH_TO_LASTPOSITION	0"
+	"		TASK_WALK_PATH					0"
+	"		TASK_WAIT_FOR_MOVEMENT			0"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_CLEAR_LASTPOSITION			0"
+	"		TASK_FACE_REASONABLE			0"
 	""
 	"	Interrupts"
-	"		COND_ENEMY_DEAD"
+	"		COND_NEW_ENEMY"
+	"		COND_SEE_FEAR"
+	"		COND_SEE_ENEMY"
 	"		COND_LIGHT_DAMAGE"
 	"		COND_HEAVY_DAMAGE"
-	"		COND_NO_PRIMARY_AMMO"
-	"		COND_WEAPON_BLOCKED_BY_FRIEND"
-	"		COND_WEAPON_SIGHT_OCCLUDED"
 	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_COMBINE_NO_FIRE"
-)
+);
+
 
 //=========================================================
-// SCHED_COMBINE_SUPPRESS
 //=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_SUPPRESS,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING			0"
-	"		TASK_FACE_ENEMY				0"
-	"		TASK_COMBINE_SET_STANDING	0"
-	"		TASK_RANGE_ATTACK1			0"
-	""
-	"	Interrupts"
-	"		COND_ENEMY_DEAD"
-	"		COND_LIGHT_DAMAGE"
-	"		COND_HEAVY_DAMAGE"
-	"		COND_NO_PRIMARY_AMMO"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_COMBINE_NO_FIRE"
-	"		COND_WEAPON_BLOCKED_BY_FRIEND"
-)
-
-//=========================================================
-// 	SCHED_COMBINE_ENTER_OVERWATCH
-//
-// Parks a combine soldier in place looking at the player's
-// last known position, ready to attack if the player pops out
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_ENTER_OVERWATCH,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING			0"
-	"		TASK_COMBINE_SET_STANDING	0"
-	"		TASK_SET_ACTIVITY			ACTIVITY:ACT_IDLE"
-	"		TASK_FACE_ENEMY				0"
-	"		TASK_SET_SCHEDULE			SCHEDULE:SCHED_COMBINE_OVERWATCH"
-	""
-	"	Interrupts"
-	"		COND_HEAR_DANGER"
-	"		COND_NEW_ENEMY"
-)
-
-//=========================================================
-// 	SCHED_COMBINE_OVERWATCH
-//
-// Parks a combine soldier in place looking at the player's
-// last known position, ready to attack if the player pops out
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_OVERWATCH,
-
-	"	Tasks"
-	"		TASK_WAIT_FACE_ENEMY		10"
-	""
-	"	Interrupts"
-	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_ENEMY_DEAD"
-	"		COND_LIGHT_DAMAGE"
-	"		COND_HEAVY_DAMAGE"
-	"		COND_NO_PRIMARY_AMMO"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_NEW_ENEMY"
-)
-
-//=========================================================
-// SCHED_COMBINE_WAIT_IN_COVER
-//	we don't allow danger or the ability
-//	to attack to break a combine's run to cover schedule but
-//	when a combine is in cover we do want them to attack if they can.
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_WAIT_IN_COVER,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING				0"
-	"		TASK_COMBINE_SET_STANDING		0"
-	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_IDLE"	// Translated to cover
-	"		TASK_WAIT_FACE_ENEMY			1"
-	""
-	"	Interrupts"
-	"		COND_NEW_ENEMY"
-	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_CAN_RANGE_ATTACK2"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK2"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_COMBINE_ATTACK_SLOT_AVAILABLE"
-)
-
-//=========================================================
-// SCHED_COMBINE_TAKE_COVER1
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_TAKE_COVER1,
-
-	"	Tasks"
-	"		TASK_SET_FAIL_SCHEDULE		SCHEDULE:SCHED_COMBINE_TAKECOVER_FAILED"
-	"		TASK_STOP_MOVING				0"
-	"		TASK_WAIT					0.2"
-	"		TASK_FIND_COVER_FROM_ENEMY	0"
-	"		TASK_RUN_PATH				0"
-	"		TASK_WAIT_FOR_MOVEMENT		0"
-	"		TASK_REMEMBER				MEMORY:INCOVER"
-	"		TASK_SET_SCHEDULE			SCHEDULE:SCHED_COMBINE_WAIT_IN_COVER"
-	""
-	"	Interrupts"
-)
-
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_TAKECOVER_FAILED,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	""
-	"	Interrupts"
-)
-
-//=========================================================
-// SCHED_COMBINE_GRENADE_COVER1
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_GRENADE_COVER1,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_FIND_COVER_FROM_ENEMY			99"
-	"		TASK_FIND_FAR_NODE_COVER_FROM_ENEMY	384"
-	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_SPECIAL_ATTACK2"
-	"		TASK_CLEAR_MOVE_WAIT				0"
-	"		TASK_RUN_PATH						0"
-	"		TASK_WAIT_FOR_MOVEMENT				0"
-	"		TASK_SET_SCHEDULE					SCHEDULE:SCHED_COMBINE_WAIT_IN_COVER"
-	""
-	"	Interrupts"
-)
-
-//=========================================================
-// SCHED_COMBINE_TOSS_GRENADE_COVER1
-//
-//	 drop grenade then run to cover.
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_TOSS_GRENADE_COVER1,
-
-	"	Tasks"
-	"		TASK_FACE_ENEMY						0"
-	"		TASK_RANGE_ATTACK2 					0"
-	"		TASK_SET_SCHEDULE					SCHEDULE:SCHED_TAKE_COVER_FROM_ENEMY"
-	""
-	"	Interrupts"
-)
-
-//=========================================================
-// SCHED_COMBINE_RANGE_ATTACK1
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_RANGE_ATTACK1,
+	SCHED_METROPOLICE_HARASS,
 
 	"	Tasks"
 	"		TASK_STOP_MOVING				0"
 	"		TASK_FACE_ENEMY					0"
-	"		TASK_ANNOUNCE_ATTACK			1"	// 1 = primary attack
-	"		TASK_WAIT_RANDOM				0.3"
-	"		TASK_RANGE_ATTACK1				0"
-	"		TASK_COMBINE_IGNORE_ATTACKS		0.5"
-	""
-	"	Interrupts"
-	"		COND_NEW_ENEMY"
-	"		COND_ENEMY_DEAD"
-	"		COND_HEAVY_DAMAGE"
-	"		COND_LIGHT_DAMAGE"
-	"		COND_LOW_PRIMARY_AMMO"
-	"		COND_NO_PRIMARY_AMMO"
-	"		COND_WEAPON_BLOCKED_BY_FRIEND"
-	"		COND_TOO_CLOSE_TO_ATTACK"
-	"		COND_GIVE_WAY"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_COMBINE_NO_FIRE"
-	""
-	// Enemy_Occluded				Don't interrupt on this.  Means
-	//								comibine will fire where player was after
-	//								he has moved for a little while.  Good effect!!
-	// WEAPON_SIGHT_OCCLUDED		Don't block on this! Looks better for railings, etc.
-)
-
-//=========================================================
-// AR2 Alt Fire Attack
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_AR2_ALTFIRE,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING									0"
-	"		TASK_ANNOUNCE_ATTACK								1"
-	"		TASK_COMBINE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET		ACTIVITY:ACT_COMBINE_AR2_ALTFIRE"
-	""
-	"	Interrupts"
-)
-
-//=========================================================
-// Mapmaker forced grenade throw
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_FORCED_GRENADE_THROW,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_COMBINE_FACE_TOSS_DIR			0"
-	"		TASK_ANNOUNCE_ATTACK				2"	// 2 = grenade
-	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_RANGE_ATTACK2"
-	"		TASK_COMBINE_DEFER_SQUAD_GRENADES	0"
-	""
-	"	Interrupts"
-)
-
-//=========================================================
-// Move to LOS of the mapmaker's forced grenade throw target
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_MOVE_TO_FORCED_GREN_LOS,
-
-	"	Tasks "
-	"		TASK_SET_TOLERANCE_DISTANCE					48"
-	"		TASK_COMBINE_GET_PATH_TO_FORCED_GREN_LOS	0"
-	"		TASK_SPEAK_SENTENCE							1"
-	"		TASK_RUN_PATH								0"
-	"		TASK_WAIT_FOR_MOVEMENT						0"
+	"		TASK_WAIT_FACE_ENEMY			6"
+	"		TASK_METROPOLICE_HARASS			0"
+	"		TASK_WAIT_PVS					0"
 	"	"
-	"	Interrupts "
-	"		COND_NEW_ENEMY"
-	"		COND_ENEMY_DEAD"
-	"		COND_CAN_MELEE_ATTACK1"
-	"		COND_CAN_MELEE_ATTACK2"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_HEAVY_DAMAGE"
-)
-
-//=========================================================
-// 	SCHED_COMBINE_RANGE_ATTACK2	
-//
-//	secondary range attack. Overriden because base class stops attacking when the enemy is occluded.
-//	combines's grenade toss requires the enemy be occluded.
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_RANGE_ATTACK2,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_COMBINE_FACE_TOSS_DIR			0"
-	"		TASK_ANNOUNCE_ATTACK				2"	// 2 = grenade
-	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_RANGE_ATTACK2"
-	"		TASK_COMBINE_DEFER_SQUAD_GRENADES	0"
-	"		TASK_SET_SCHEDULE					SCHEDULE:SCHED_COMBINE_WAIT_IN_COVER"	// don't run immediately after throwing grenade.
-	""
 	"	Interrupts"
-)
-
-
-//=========================================================
-// Throw a grenade, then run off and reload.
-//=========================================================
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_GRENADE_AND_RELOAD,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_COMBINE_FACE_TOSS_DIR			0"
-	"		TASK_ANNOUNCE_ATTACK				2"	// 2 = grenade
-	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_RANGE_ATTACK2"
-	"		TASK_COMBINE_DEFER_SQUAD_GRENADES	0"
-	"		TASK_SET_SCHEDULE					SCHEDULE:SCHED_HIDE_AND_RELOAD"	// don't run immediately after throwing grenade.
-	""
-	"	Interrupts"
-)
-
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_PATROL,
-
-	"	Tasks"
-	"		TASK_STOP_MOVING				0"
-	"		TASK_WANDER						900540"
-	"		TASK_WALK_PATH					0"
-	"		TASK_WAIT_FOR_MOVEMENT			0"
-	"		TASK_STOP_MOVING				0"
-	"		TASK_FACE_REASONABLE			0"
-	"		TASK_WAIT						3"
-	"		TASK_WAIT_RANDOM				3"
-	"		TASK_SET_SCHEDULE				SCHEDULE:SCHED_COMBINE_PATROL" // keep doing it
-	""
-	"	Interrupts"
-	"		COND_ENEMY_DEAD"
-	"		COND_LIGHT_DAMAGE"
-	"		COND_HEAVY_DAMAGE"
-	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
-	"		COND_NEW_ENEMY"
-	"		COND_SEE_ENEMY"
+	"	"
 	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_CAN_RANGE_ATTACK2"
-)
+	"		COND_NEW_ENEMY"
+);
 
+
+//=========================================================
+//=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_BUGBAIT_DISTRACTION,
+	SCHED_METROPOLICE_DRAW_PISTOL,
 
 	"	Tasks"
-	"		TASK_STOP_MOVING		0"
-	"		TASK_RESET_ACTIVITY		0"
-	"		TASK_PLAY_SEQUENCE		ACTIVITY:ACT_COMBINE_BUGBAIT"
-	""
+	"		TASK_STOP_MOVING				0"
+	"		TASK_PLAY_SEQUENCE_FACE_ENEMY	ACTIVITY:ACT_METROPOLICE_DRAW_PISTOL"
+	"		TASK_WAIT_FACE_ENEMY			0.1"
+	"	"
 	"	Interrupts"
-	""
-)
+	"	"
+);
+
 
 //=========================================================
-// SCHED_COMBINE_CHARGE_TURRET
-//
-//	Used to run straight at enemy turrets to knock them over.
-//  Prevents squadmates from throwing grenades during.
+// > ChaseEnemy
 //=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_CHARGE_TURRET,
+	SCHED_METROPOLICE_CHASE_ENEMY,
 
 	"	Tasks"
-	"		TASK_COMBINE_DEFER_SQUAD_GRENADES	0"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_SET_FAIL_SCHEDULE				SCHEDULE:SCHED_CHASE_ENEMY_FAILED"
-	"		TASK_GET_CHASE_PATH_TO_ENEMY		300"
-	"		TASK_RUN_PATH						0"
-	"		TASK_WAIT_FOR_MOVEMENT				0"
-	"		TASK_FACE_ENEMY						0"
-	""
+	"		TASK_STOP_MOVING				0"
+	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_METROPOLICE_ESTABLISH_LINE_OF_FIRE"
+	"		TASK_SET_TOLERANCE_DISTANCE		24"
+	"		TASK_GET_CHASE_PATH_TO_ENEMY	300"
+	"		TASK_SPEAK_SENTENCE				6"	// METROPOLICE_SENTENCE_MOVE_INTO_POSITION
+	"		TASK_RUN_PATH					0"
+	"		TASK_METROPOLICE_RESET_LEDGE_CHECK_TIME 0"
+	"		TASK_WAIT_FOR_MOVEMENT			0"
+	"		TASK_FACE_ENEMY					0"
+	"	"
 	"	Interrupts"
 	"		COND_NEW_ENEMY"
 	"		COND_ENEMY_DEAD"
 	"		COND_ENEMY_UNREACHABLE"
+	"		COND_CAN_RANGE_ATTACK1"
 	"		COND_CAN_MELEE_ATTACK1"
+	"		COND_CAN_RANGE_ATTACK2"
 	"		COND_CAN_MELEE_ATTACK2"
 	"		COND_TOO_CLOSE_TO_ATTACK"
 	"		COND_TASK_FAILED"
 	"		COND_LOST_ENEMY"
 	"		COND_BETTER_WEAPON_AVAILABLE"
 	"		COND_HEAR_DANGER"
-)
+);
+
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_ESTABLISH_LINE_OF_FIRE,
+
+	"	Tasks "
+	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_FAIL_ESTABLISH_LINE_OF_FIRE"
+	"		TASK_FACE_ENEMY					0"
+	"		TASK_SET_TOLERANCE_DISTANCE		48"
+	"		TASK_GET_PATH_TO_ENEMY_LKP_LOS	0"
+	"		TASK_SPEAK_SENTENCE				6"	// METROPOLICE_SENTENCE_MOVE_INTO_POSITION
+	"		TASK_RUN_PATH					0"
+	"		TASK_METROPOLICE_RESET_LEDGE_CHECK_TIME 0"
+	"		TASK_WAIT_FOR_MOVEMENT			0"
+	"		TASK_SET_SCHEDULE				SCHEDULE:SCHED_COMBAT_FACE"
+	"	"
+	"	Interrupts "
+	"		COND_NEW_ENEMY"
+	"		COND_ENEMY_DEAD"
+	"		COND_CAN_RANGE_ATTACK1"
+	"		COND_CAN_RANGE_ATTACK2"
+	"		COND_CAN_MELEE_ATTACK1"
+	"		COND_CAN_MELEE_ATTACK2"
+	"		COND_HEAR_DANGER"
+	"		COND_HEAVY_DAMAGE"
+);
+
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_ESTABLISH_STITCH_LINE_OF_FIRE,
+
+	"	Tasks "
+	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_FAIL_ESTABLISH_LINE_OF_FIRE"
+	"		TASK_FACE_ENEMY					0"
+	"		TASK_SET_TOLERANCE_DISTANCE		48"
+	"		TASK_METROPOLICE_GET_PATH_TO_STITCH	0"
+	"		TASK_RUN_PATH					0"
+	"		TASK_WAIT_FOR_MOVEMENT			0"
+	"		TASK_SET_SCHEDULE				SCHEDULE:SCHED_COMBAT_FACE"
+	"	"
+	"	Interrupts "
+	"		COND_NEW_ENEMY"
+	"		COND_ENEMY_DEAD"
+	"		COND_HEAR_DANGER"
+	"		COND_HEAVY_DAMAGE"
+);
+
 
 //=========================================================
-// SCHED_COMBINE_CHARGE_PLAYER
-//
-//	Used to run straight at enemy player since physgun combat
-//  is more fun when the enemies are close
+// The uninterruptible portion of this behavior, whereupon 
+// the police actually releases the manhack.
 //=========================================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_CHARGE_PLAYER,
+	SCHED_METROPOLICE_DEPLOY_MANHACK,
+
+	"	Tasks"
+	"		TASK_SPEAK_SENTENCE					5"	// METROPOLICE_SENTENCE_DEPLOY_MANHACK
+	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_METROPOLICE_DEPLOY_MANHACK"
+	"	"
+	"	Interrupts"
+	"	"
+);
+
+
+//===============================================
+//===============================================
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_ADVANCE,
 
 	"	Tasks"
 	"		TASK_STOP_MOVING					0"
-	"		TASK_SET_FAIL_SCHEDULE				SCHEDULE:SCHED_CHASE_ENEMY_FAILED"
-	"		TASK_COMBINE_CHASE_ENEMY_CONTINUOUSLY		192"
+	"		TASK_SET_ACTIVITY					ACTIVITY:ACT_IDLE_ANGRY"
 	"		TASK_FACE_ENEMY						0"
+	"		TASK_WAIT_FACE_ENEMY				1" // give the guy some time to come out on his own
+	"		TASK_WAIT_FACE_ENEMY_RANDOM			3" 
+	"		TASK_GET_PATH_TO_ENEMY_LOS			0"
+	"		TASK_RUN_PATH						0"
+	"		TASK_WAIT_FOR_MOVEMENT				0"
+	"		TASK_SET_ACTIVITY					ACTIVITY:ACT_IDLE_ANGRY"
+	"		TASK_FACE_ENEMY						0"
+	""
+	"	Interrupts"
+	"		COND_CAN_RANGE_ATTACK1"
+	"		COND_ENEMY_DEAD"
+	""
+);
+
+//===============================================
+//===============================================
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_CHARGE,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_METROPOLICE_ADVANCE"
+//	"		TASK_SET_TOLERANCE_DISTANCE		24"
+	"		TASK_STORE_LASTPOSITION			0"
+	"		TASK_GET_CHASE_PATH_TO_ENEMY	300"
+	"		TASK_RUN_PATH_FOR_UNITS			150"
+	"		TASK_STOP_MOVING				1"
+	"		TASK_FACE_ENEMY			0"
 	""
 	"	Interrupts"
 	"		COND_NEW_ENEMY"
 	"		COND_ENEMY_DEAD"
-	"		COND_ENEMY_UNREACHABLE"
+	"		COND_LOST_ENEMY"
+	"		COND_CAN_MELEE_ATTACK1"
+	"		COND_CAN_MELEE_ATTACK2"
+	"		COND_HEAR_DANGER"
+	"		COND_METROPOLICE_PLAYER_TOO_CLOSE"
+);
+
+//=========================================================
+//=========================================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_BURNING_RUN,
+
+	"	Tasks"
+	"		TASK_SET_FAIL_SCHEDULE			SCHEDULE:SCHED_METROPOLICE_BURNING_STAND"
+	"		TASK_SET_TOLERANCE_DISTANCE		24"
+	"		TASK_GET_PATH_TO_ENEMY			0"
+	"		TASK_RUN_PATH_TIMED				10"	
+	"		TASK_METROPOLICE_DIE_INSTANTLY	0"
+	"	"
+	"	Interrupts"
+);
+
+//=========================================================
+//=========================================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_BURNING_STAND,
+
+	"	Tasks"
+	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_IDLE_ON_FIRE"
+	"		TASK_WAIT						1.5"
+	"		TASK_METROPOLICE_DIE_INSTANTLY	DMG_BURN"
+	"		TASK_WAIT						1.0"
+	"	"
+	"	Interrupts"
+);
+
+//=========================================================
+//=========================================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_RETURN_TO_PRECHASE,
+
+	"	Tasks"
+	"		TASK_WAIT_RANDOM						1"
+	"		TASK_METROPOLICE_GET_PATH_TO_PRECHASE	0"
+	"		TASK_WALK_PATH							0"
+	"		TASK_WAIT_FOR_MOVEMENT					0"
+	"		TASK_STOP_MOVING						0"
+	"		TASK_METROPOLICE_CLEAR_PRECHASE			0"
+	"	"
+	"	Interrupts"
+	"		COND_NEW_ENEMY"
 	"		COND_CAN_MELEE_ATTACK1"
 	"		COND_CAN_MELEE_ATTACK2"
 	"		COND_TASK_FAILED"
 	"		COND_LOST_ENEMY"
 	"		COND_HEAR_DANGER"
-)
+);
 
-//=========================================================
-// SCHED_COMBINE_DROP_GRENADE
-//
-//	Place a grenade at my feet
-//=========================================================
+//===============================================
+//===============================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_DROP_GRENADE,
+	SCHED_METROPOLICE_ALERT_FACE_BESTSOUND,
 
 	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_SPECIAL_ATTACK2"
-	"		TASK_FIND_COVER_FROM_ENEMY			99"
-	"		TASK_FIND_FAR_NODE_COVER_FROM_ENEMY	384"
-	"		TASK_CLEAR_MOVE_WAIT				0"
-	"		TASK_RUN_PATH						0"
-	"		TASK_WAIT_FOR_MOVEMENT				0"
+	"		TASK_SPEAK_SENTENCE		7"	// METROPOLICE_SENTENCE_HEARD_SOMETHING
+	"		TASK_SET_SCHEDULE		SCHEDULE:SCHED_ALERT_FACE_BESTSOUND"
 	""
 	"	Interrupts"
+	""
 )
 
-//=========================================================
-// SCHED_COMBINE_PATROL_ENEMY
-//
-// Used instead if SCHED_COMBINE_PATROL if I have an enemy.
-// Wait for the enemy a bit in the hopes of ambushing him.
-//=========================================================
+
+//===============================================
+//===============================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_PATROL_ENEMY,
+	SCHED_METROPOLICE_ENEMY_RESISTING_ARREST,
 
 	"	Tasks"
-	"		TASK_STOP_MOVING					0"
-	"		TASK_WAIT_FACE_ENEMY				1"
-	"		TASK_WAIT_FACE_ENEMY_RANDOM			3"
+	"		TASK_METROPOLICE_SIGNAL_FIRING_TIME		0"
 	""
 	"	Interrupts"
-	"		COND_ENEMY_DEAD"
+	""
+)
+
+
+//===============================================
+//===============================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_WARN_AND_ARREST_ENEMY,
+
+	"	Tasks"
+	"		TASK_SET_FAIL_SCHEDULE				SCHEDULE:SCHED_METROPOLICE_ENEMY_RESISTING_ARREST"
+	"		TASK_STOP_MOVING					0"
+	"		TASK_PLAY_SEQUENCE_FACE_ENEMY		ACTIVITY:ACT_IDLE_ANGRY"
+	"		TASK_SPEAK_SENTENCE					0"	// "Freeze!"
+	"		TASK_METROPOLICE_ARREST_ENEMY		0.5"
+	"		TASK_STORE_ENEMY_POSITION_IN_SAVEPOSITION	0"
+	"		TASK_METROPOLICE_ARREST_ENEMY		1"
+	"		TASK_METROPOLICE_WAIT_FOR_SENTENCE	1"
+	"		TASK_SPEAK_SENTENCE					1"	// "He's over here!"
+	"		TASK_METROPOLICE_LEAD_ARREST_ENEMY	5"
+	"		TASK_METROPOLICE_ARREST_ENEMY		2"
+	"		TASK_METROPOLICE_WAIT_FOR_SENTENCE	1"
+	"		TASK_SPEAK_SENTENCE					3"	// "Take him down!"
+	"		TASK_METROPOLICE_ARREST_ENEMY		1.5"
+	"		TASK_METROPOLICE_WAIT_FOR_SENTENCE	2"
+	"		TASK_METROPOLICE_SIGNAL_FIRING_TIME	0"
+	""
+	"	Interrupts"
+	"		COND_NEW_ENEMY"
 	"		COND_LIGHT_DAMAGE"
 	"		COND_HEAVY_DAMAGE"
 	"		COND_HEAR_DANGER"
-	"		COND_HEAR_MOVE_AWAY"
+	"		COND_ENEMY_DEAD"
+	"		COND_METROPOLICE_ENEMY_RESISTING_ARREST"
+	""
+);
+
+//===============================================
+//===============================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_ARREST_ENEMY,
+
+	"	Tasks"
+	"		TASK_SET_FAIL_SCHEDULE				SCHEDULE:SCHED_METROPOLICE_ENEMY_RESISTING_ARREST"
+	"		TASK_GET_PATH_TO_ENEMY_LOS			0"
+	"		TASK_RUN_PATH						0"
+	"		TASK_WAIT_FOR_MOVEMENT				0"
+	"		TASK_STOP_MOVING					0"
+	"		TASK_PLAY_SEQUENCE_FACE_ENEMY		ACTIVITY:ACT_IDLE_ANGRY"
+	"		TASK_METROPOLICE_WAIT_FOR_SENTENCE	0"
+	"		TASK_SPEAK_SENTENCE					4"
+	"		TASK_METROPOLICE_ARREST_ENEMY		30"
+	""
+	"	Interrupts"
 	"		COND_NEW_ENEMY"
-	"		COND_SEE_ENEMY"
-	"		COND_CAN_RANGE_ATTACK1"
-	"		COND_CAN_RANGE_ATTACK2"
-)
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_HEAR_DANGER"
+	"		COND_ENEMY_DEAD"
+	"		COND_METROPOLICE_ENEMY_RESISTING_ARREST"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
+	"		COND_WEAPON_SIGHT_OCCLUDED"
+	""
+);
 
+
+//===============================================
+//===============================================
 DEFINE_SCHEDULE
 (
-	SCHED_COMBINE_BURNING_STAND,
+	SCHED_METROPOLICE_SMG_NORMAL_ATTACK,
 
 	"	Tasks"
-	"		TASK_SET_ACTIVITY				ACTIVITY:ACT_COMBINE_BUGBAIT"
-	"		TASK_RANDOMIZE_FRAMERATE		20"
-	"		TASK_WAIT						2"
-	"		TASK_WAIT_RANDOM				3"
-	"		TASK_COMBINE_DIE_INSTANTLY		DMG_BURN"
-	"		TASK_WAIT						1.0"
-	"	"
-	"	Interrupts"
-)
-
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_FACE_IDEAL_YAW,
-
-	"	Tasks"
-	"		TASK_FACE_IDEAL				0"
-	"	"
-	"	Interrupts"
-)
-
-DEFINE_SCHEDULE
-(
-	SCHED_COMBINE_MOVE_TO_MELEE,
-
-	"	Tasks"
-	"		TASK_STORE_ENEMY_POSITION_IN_SAVEPOSITION	0"
-	"		TASK_GET_PATH_TO_SAVEPOSITION				0"
-	"		TASK_RUN_PATH								0"
-	"		TASK_WAIT_FOR_MOVEMENT						0"
-	" "
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_STOP_FIRE_BURST	0"
+	"		TASK_RANGE_ATTACK1		0"
+	""
 	"	Interrupts"
 	"		COND_NEW_ENEMY"
 	"		COND_ENEMY_DEAD"
-	"		COND_CAN_MELEE_ATTACK1"
-)
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_ENEMY_OCCLUDED"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
+	"		COND_WEAPON_SIGHT_OCCLUDED"
+);
 
-//=========================================================
-// SCHED_COMBINE_RETURN_GRENADE
-// [MODIFICATION] Custom schedule for the "Catch and Return" ability.
-// Defines the sequence for pulling, re-priming, aiming, and throwing back an enemy grenade.
-//=========================================================
+
+//===============================================
+//===============================================
 DEFINE_SCHEDULE
 (
-SCHED_COMBINE_RETURN_GRENADE,
+	SCHED_METROPOLICE_SMG_BURST_ATTACK,
 
-"	Tasks"
-"		TASK_STOP_MOVING				0"		// 1. Stop moving to focus on the action.
-"		TASK_COMBINE_FACE_GRENADE		0"		// 2. Perform a fast turn to face the grenade.
-"		TASK_SET_ACTIVITY				ACTIVITY:ACT_COVER_LOW"	// 3. Start the crouch animation (non-blocking).
-"		TASK_COMBINE_PULL_GRENADE		0"		// 4. Pull the grenade in; this task also resets its fuse timer.
-"		TASK_FACE_ENEMY					0"		// 5. Turn to face the enemy to aim the counter-throw.
-"		TASK_SET_ACTIVITY				ACTIVITY:ACT_RANGE_ATTACK2"	// 6. Start the throw animation (which includes standing up).
-"		TASK_WAIT						0.7"	// 7. A controlled pause for the throw animation's wind-up.
-"		TASK_COMBINE_LAUNCH_GRENADE		0"		// 8. Launch the original grenade back at the enemy.
-""
+	"	Tasks"
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_RELOAD_FOR_BURST	1.4"
+	"		TASK_METROPOLICE_AIM_STITCH_AT_PLAYER	1.4"
+	"		TASK_METROPOLICE_BURST_ATTACK		0"
+	"		TASK_FACE_ENEMY			0"
+	""
+	"	Interrupts"
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
 
-"	Interrupts"
-"		COND_HEAVY_DAMAGE"						// Abort if heavy damage is taken.
-"		COND_NO_SOUND"							// Abort if the grenade sound disappears.
-)
+);
 
-//=========================================================
-// SCHED_COMBINE_KICK_GRENADE
-// [MODIFICATION] Custom schedule for the alternative "Kick Grenade" ability.
-// Defines a fast, reactive sequence to kick a nearby grenade away.
-//=========================================================
+//===============================================
+//===============================================
 DEFINE_SCHEDULE
 (
-SCHED_COMBINE_KICK_GRENADE,
+	SCHED_METROPOLICE_AIM_STITCH_TIGHTLY,
 
-"	Tasks"
-"		TASK_COMBINE_MEMORIZE_GRENADE	0"		// 1. Instantly "memorize" the grenade as the target for the kick.
-"		TASK_STOP_MOVING				0"		// 2. Stop moving.
-"		TASK_COMBINE_FACE_GRENADE		0"		// 3. Perform a fast turn to face the grenade.
-"		TASK_SET_ACTIVITY				ACTIVITY:ACT_MELEE_ATTACK2"	// 4. Start the kick animation (non-blocking).
-"		TASK_WAIT						0.3"	// 5. A minimal pause to sync the animation with the physics.
-"		TASK_COMBINE_KICK_LAUNCH		0"		// 6. Apply the kick physics to the memorized grenade.
-""
+	"	Tasks"
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_RELOAD_FOR_BURST	1.0"
+	"		TASK_METROPOLICE_AIM_STITCH_TIGHTLY	1.0"
+	"		TASK_METROPOLICE_BURST_ATTACK		0"
+	"		TASK_FACE_ENEMY			0"
+	""
+	"	Interrupts"
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
 
-"	Interrupts"
-"		COND_HEAVY_DAMAGE"
-"		COND_NO_SOUND"
-)
+);
+
+
+//===============================================
+//===============================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_AIM_STITCH_AT_AIRBOAT,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_RELOAD_FOR_BURST		2.5"
+	"		TASK_METROPOLICE_AIM_STITCH_AT_AIRBOAT	2.5"
+	"		TASK_METROPOLICE_BURST_ATTACK		0"
+	"		TASK_FACE_ENEMY			0"
+	""
+	"	Interrupts"
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
+
+);
+
+//===============================================
+//===============================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_AIM_STITCH_IN_FRONT_OF_AIRBOAT,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_RELOAD_FOR_BURST		2.5"
+	"		TASK_METROPOLICE_AIM_STITCH_IN_FRONT_OF_AIRBOAT	2.5"
+	"		TASK_METROPOLICE_BURST_ATTACK		0"
+	"		TASK_FACE_ENEMY			0"
+	""
+	"	Interrupts"
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
+
+);
+
+//===============================================
+//===============================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_AIM_STITCH_ALONG_SIDE_OF_AIRBOAT,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_RELOAD_FOR_BURST		2.5"
+	"		TASK_METROPOLICE_AIM_STITCH_ALONG_SIDE_OF_AIRBOAT	2.5"
+	"		TASK_METROPOLICE_BURST_ATTACK		0"
+	"		TASK_FACE_ENEMY			0"
+	""
+	"	Interrupts"
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
+
+);
+
+//===============================================
+//===============================================
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_AIM_STITCH_BEHIND_AIRBOAT,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING		0"
+	"		TASK_FACE_ENEMY			0"
+	"		TASK_ANNOUNCE_ATTACK	1"	// 1 = primary attack
+	"		TASK_METROPOLICE_RELOAD_FOR_BURST		2.5"
+	"		TASK_METROPOLICE_AIM_STITCH_BEHIND_AIRBOAT	2.5"
+	"		TASK_METROPOLICE_BURST_ATTACK		0"
+	"		TASK_FACE_ENEMY			0"
+	""
+	"	Interrupts"
+	"		COND_LIGHT_DAMAGE"
+	"		COND_HEAVY_DAMAGE"
+	"		COND_NO_PRIMARY_AMMO"
+	"		COND_HEAR_DANGER"
+	"		COND_WEAPON_BLOCKED_BY_FRIEND"
+
+);
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_SHOVE,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_FACE_PLAYER				0.1"	//FIXME: This needs to be the target or enemy
+	"		TASK_METROPOLICE_ACTIVATE_BATON	1"
+	"		TASK_PLAY_SEQUENCE				ACTIVITY:ACT_PUSH_PLAYER"
+	""
+	"	Interrupts"
+);
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_ACTIVATE_BATON,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_FACE_TARGET				0"
+	"		TASK_METROPOLICE_ACTIVATE_BATON	1"
+	""
+	"	Interrupts"
+);
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_DEACTIVATE_BATON,
+
+	"	Tasks"
+	"		TASK_STOP_MOVING				0"
+	"		TASK_METROPOLICE_ACTIVATE_BATON	0"
+	""
+	"	Interrupts"
+);
+
+DEFINE_SCHEDULE
+(
+	SCHED_METROPOLICE_SMASH_PROP,
+
+	"	Tasks"
+	"		TASK_GET_PATH_TO_TARGET		0"
+	"		TASK_MOVE_TO_TARGET_RANGE	50"
+	"		TASK_STOP_MOVING			0"
+	"		TASK_FACE_TARGET			0"
+	"		TASK_ANNOUNCE_ATTACK		1"	// 1 = primary attack
+	"		TASK_PLAY_SEQUENCE			ACTIVITY:ACT_MELEE_ATTACK1"
+	""
+	"	Interrupts"
+	"		COND_NEW_ENEMY"
+	"		COND_ENEMY_DEAD"
+);
+
+#ifdef MAPBASE
+//=========================================================
+ // Mapmaker forced grenade throw
+ //=========================================================
+ DEFINE_SCHEDULE
+ (
+ SCHED_METROPOLICE_FORCED_GRENADE_THROW,
+
+ "	Tasks"
+ "		TASK_STOP_MOVING					0"
+ "		TASK_METROPOLICE_FACE_TOSS_DIR			0"
+ "		TASK_ANNOUNCE_ATTACK				2"	// 2 = grenade
+ "		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_RANGE_ATTACK2"
+ "		TASK_METROPOLICE_DEFER_SQUAD_GRENADES	0"
+ ""
+ "	Interrupts"
+ )
+
+ //=========================================================
+ // Move to LOS of the mapmaker's forced grenade throw target
+ //=========================================================
+ DEFINE_SCHEDULE
+ (
+ SCHED_METROPOLICE_MOVE_TO_FORCED_GREN_LOS,
+
+ "	Tasks "
+ "		TASK_SET_TOLERANCE_DISTANCE					48"
+ "		TASK_METROPOLICE_GET_PATH_TO_FORCED_GREN_LOS	0"
+ "		TASK_SPEAK_SENTENCE							1"
+ "		TASK_RUN_PATH								0"
+ "		TASK_WAIT_FOR_MOVEMENT						0"
+ "	"
+ "	Interrupts "
+ "		COND_NEW_ENEMY"
+ "		COND_ENEMY_DEAD"
+ "		COND_CAN_MELEE_ATTACK1"
+ "		COND_CAN_MELEE_ATTACK2"
+ "		COND_HEAR_DANGER"
+ "		COND_HEAR_MOVE_AWAY"
+ "		COND_HEAVY_DAMAGE"
+ )
+
+ //=========================================================
+ // 	SCHED_METROPOLICE_RANGE_ATTACK2	
+ //
+ //	secondary range attack. Overriden because base class stops attacking when the enemy is occluded.
+ //	combines's grenade toss requires the enemy be occluded.
+ //=========================================================
+ DEFINE_SCHEDULE
+ (
+ SCHED_METROPOLICE_RANGE_ATTACK2,
+
+ "	Tasks"
+ "		TASK_STOP_MOVING					0"
+ "		TASK_METROPOLICE_FACE_TOSS_DIR			0"
+ "		TASK_ANNOUNCE_ATTACK				2"	// 2 = grenade
+ "		TASK_PLAY_SEQUENCE					ACTIVITY:ACT_RANGE_ATTACK2"
+ "		TASK_METROPOLICE_DEFER_SQUAD_GRENADES	0"
+ "		TASK_SET_SCHEDULE					SCHEDULE:SCHED_HIDE_AND_RELOAD"	// don't run immediately after throwing grenade.
+ ""
+ "	Interrupts"
+ )
+
+ DEFINE_SCHEDULE
+ (
+ SCHED_METROPOLICE_KICK_GRENADE,
+
+ "	Tasks"
+ "		TASK_METROPOLICE_MEMORIZE_GRENADE	0"		// [MODIFICATION] 1. Instantly "memorizes" the grenade as the target.
+ "		TASK_STOP_MOVING				0"					// 2. Stop moving.
+ "		TASK_METROPOLICE_FACE_GRENADE		0"		// [MODIFICATION] 3. Performs a fast turn to face the grenade.
+ "		TASK_METROPOLICE_KICK_LAUNCH		0"		// [MODIFICATION] 4. Applies the physical kick force immediately after the animation finishes.
+ "		TASK_METROPOLICE_PLAY_KICK_ANIMATION	0"		// [MODIFICATION] 5. Plays the kick animation at high speed.
+  
+ ""
+ "	Interrupts"
+ )
+
+ //=========================================================
+ // AR2 Alt Fire Attack
+ //=========================================================
+ DEFINE_SCHEDULE
+ (
+ SCHED_METROPOLICE_AR2_ALTFIRE,
+
+ "	Tasks"
+ "		TASK_STOP_MOVING									0"
+ "		TASK_ANNOUNCE_ATTACK								1"
+ "		TASK_METROPOLICE_PLAY_SEQUENCE_FACE_ALTFIRE_TARGET		ACTIVITY:ACT_COMBINE_AR2_ALTFIRE"
+ ""
+ "	Interrupts"
+ "		COND_TOO_CLOSE_TO_ATTACK"
+ )
+#endif
 
 AI_END_CUSTOM_NPC()
+
