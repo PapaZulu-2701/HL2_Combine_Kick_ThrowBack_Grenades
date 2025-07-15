@@ -5411,7 +5411,7 @@ void CNPC_MetroPolice::StartTask(const Task_t* pTask)
 		{
 			SetSequence(kickSequence);	// Sets the NPC's current animation to the one that was found.
 
-			m_flPlaybackRate = 3.0f; // [CORRECTION] Increases animation speed by 2x for an instant effect, even in combat.
+			m_flPlaybackRate = 3.0f; // [CORRECTION] Increases animation speed by 3x for an instant effect, even in combat.
 
 			SetIdealActivity(ACT_DO_NOT_DISTURB); // Sets the AI state to prevent other behaviors from interrupting the animation.
 		}
